@@ -5481,6 +5481,37 @@ static struct file_system_type sdfat_fs_type = {
 #endif /* CONFIG_SDFAT_DBG_IOCTL */
 	.fs_flags    = FS_REQUIRES_DEV,
 };
+<<<<<<< HEAD
+=======
+
+#ifdef CONFIG_SDFAT_USE_FOR_EXFAT
+static struct file_system_type exfat_fs_type = {
+	.owner       = THIS_MODULE,
+	.name        = "exfat",
+	.mount       = sdfat_fs_mount,
+#ifdef CONFIG_SDFAT_DBG_IOCTL
+	.kill_sb    = sdfat_debug_kill_sb,
+#else
+	.kill_sb    = kill_block_super,
+#endif /* CONFIG_SDFAT_DBG_IOCTL */
+	.fs_flags    = FS_REQUIRES_DEV,
+};
+#endif /* CONFIG_SDFAT_USE_FOR_EXFAT */
+
+#ifdef CONFIG_SDFAT_USE_FOR_VFAT
+static struct file_system_type vfat_fs_type = {
+	.owner       = THIS_MODULE,
+	.name        = "vfat",
+	.mount       = sdfat_fs_mount,
+#ifdef CONFIG_SDFAT_DBG_IOCTL
+	.kill_sb    = sdfat_debug_kill_sb,
+#else
+	.kill_sb    = kill_block_super,
+#endif /* CONFIG_SDFAT_DBG_IOCTL */
+	.fs_flags    = FS_REQUIRES_DEV,
+};
+#endif /* CONFIG_SDFAT_USE_FOR_VFAT */
+>>>>>>> 3d037a444 (Revert "fs: sdfat: Add MODULE_ALIAS_FS for supported filesystems")
 
 static int __init init_sdfat_fs(void)
 {
