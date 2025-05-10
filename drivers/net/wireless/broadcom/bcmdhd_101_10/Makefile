@@ -334,8 +334,23 @@ DHDCFLAGS += -DSET_SSID_FAIL_CUSTOM_RC=100
 # 6GHz support
 DHDCFLAGS += -DWL_6G_BAND
 
-DHDCFLAGS += -DANDROID_PLATFORM_VERSION=13
+# Android Version Check from Platform source
+ifneq ($(ANDROID_VERSION),)
+MAJOR_VERSION := $(shell echo $(ANDROID_VERSION) | rev | cut -c 5- | rev)
+DHDCFLAGS += -DANDROID_PLATFORM_VERSION=$(MAJOR_VERSION)
+else
+ifneq ($(PLATFORM_VERSION),)
+MAJOR_VERSION := $(shell echo $(PLATFORM_VERSION) | cut -d "." -f 1)
+DHDCFLAGS += -DANDROID_PLATFORM_VERSION=$(MAJOR_VERSION)
+endif
+endif
+
+ifneq ($(PLATFORM_VERSION),)
+# Android O-OS (version 8) support
+ifeq ($(shell expr $(PLATFORM_VERSION) \>= 8.0),1)
 DHDCFLAGS += -DCUSTOM_ASSOC_TIMEOUT=20
+endif
+endif
 
 # Change Dump path by Android Global DE Policy
 ifeq ($(CONFIG_WLAN_VENDOR_DUMP_ENABLE),y)
@@ -408,13 +423,17 @@ endif
 ##########################
 DRIVER_TYPE ?= m
 
-
+$(warning DHD_CONFIG_BCM4389 = $(CONFIG_BCM4389))
+$(warning DHD_CONFIG_BCM4375 = $(CONFIG_BCM4375))
 ifneq ($(filter c2% c1%, $(TARGET_PRODUCT)), )
-ifeq ($(SEC_BUILD_OPTION_HW_REVISION),00)
+ifeq ($(SEC_BUILD_OPTION_HW_REVISION),01)
 CONFIG_BCM4389=y
 CONFIG_BCM4375=n
 endif
 endif
+$(warning After DHD_CONFIG_BCM4389 = $(CONFIG_BCM4389))
+$(warning After DHD_CONFIG_BCM4375 = $(CONFIG_BCM4375))
+
 #########################
 # Chip dependent feature
 #########################

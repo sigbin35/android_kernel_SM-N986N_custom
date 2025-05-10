@@ -66,10 +66,6 @@ struct wakeup_source {
 	ktime_t last_time;
 	ktime_t start_prevent_time;
 	ktime_t prevent_sleep_time;
-#ifdef CONFIG_SEC_PM_DEBUG
-	ktime_t start_screen_off;
-	ktime_t time_with_screen_off;
-#endif
 	unsigned long		event_count;
 	unsigned long		active_count;
 	unsigned long		relax_count;
@@ -78,10 +74,9 @@ struct wakeup_source {
 	struct device		*dev;
 	bool			active:1;
 	bool			autosleep_enabled:1;
-#ifdef CONFIG_SEC_PM_DEBUG
-	bool			is_screen_off:1;
-#endif
 };
+
+#define WAKEUP_SOURCE_DEV
 
 #ifdef CONFIG_PM_SLEEP
 
@@ -105,9 +100,7 @@ static inline void device_set_wakeup_path(struct device *dev)
 }
 
 /* drivers/base/power/wakeup.c */
-extern void wakeup_source_prepare(struct wakeup_source *ws, const char *name);
 extern struct wakeup_source *wakeup_source_create(const char *name);
-extern void wakeup_source_drop(struct wakeup_source *ws);
 extern void wakeup_source_destroy(struct wakeup_source *ws);
 extern void wakeup_source_add(struct wakeup_source *ws);
 extern void wakeup_source_remove(struct wakeup_source *ws);
@@ -138,15 +131,10 @@ static inline bool device_can_wakeup(struct device *dev)
 	return dev->power.can_wakeup;
 }
 
-static inline void wakeup_source_prepare(struct wakeup_source *ws,
-					 const char *name) {}
-
 static inline struct wakeup_source *wakeup_source_create(const char *name)
 {
 	return NULL;
 }
-
-static inline void wakeup_source_drop(struct wakeup_source *ws) {}
 
 static inline void wakeup_source_destroy(struct wakeup_source *ws) {}
 
@@ -209,18 +197,10 @@ static inline void pm_wakeup_dev_event(struct device *dev, unsigned int msec,
 				       bool hard) {}
 
 #endif /* !CONFIG_PM_SLEEP */
-
 static inline void wakeup_source_init(struct wakeup_source *ws,
 				      const char *name)
 {
-	wakeup_source_prepare(ws, name);
-	wakeup_source_add(ws);
-}
-
-static inline void wakeup_source_trash(struct wakeup_source *ws)
-{
-	wakeup_source_remove(ws);
-	wakeup_source_drop(ws);
+	ws = wakeup_source_register(NULL, name);
 }
 
 static inline void __pm_wakeup_event(struct wakeup_source *ws, unsigned int msec)

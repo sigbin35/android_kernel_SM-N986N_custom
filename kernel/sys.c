@@ -73,11 +73,11 @@
 #include <asm/io.h>
 #include <asm/unistd.h>
 
-#include "uid16.h"
-
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs.h>
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
 #endif
+
+#include "uid16.h"
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
@@ -126,6 +126,12 @@
 #endif
 #ifndef SVE_GET_VL
 # define SVE_GET_VL()		(-EINVAL)
+#endif
+#ifndef SET_TAGGED_ADDR_CTRL
+# define SET_TAGGED_ADDR_CTRL(a)	(-EINVAL)
+#endif
+#ifndef GET_TAGGED_ADDR_CTRL
+# define GET_TAGGED_ADDR_CTRL()		(-EINVAL)
 #endif
 
 /*
@@ -811,6 +817,11 @@ long __sys_setfsuid(uid_t uid)
 	if (!uid_valid(kuid))
 		return old_fsuid;
 
+#ifdef CONFIG_SECURITY_DEFEX
+	if (task_defex_enforce(current, NULL, -__NR_setfsuid))
+		return old_fsuid;
+#endif
+
 	new = prepare_creds();
 	if (!new)
 		return old_fsuid;
@@ -854,6 +865,11 @@ long __sys_setfsgid(gid_t gid)
 	kgid = make_kgid(old->user_ns, gid);
 	if (!gid_valid(kgid))
 		return old_fsgid;
+
+#ifdef CONFIG_SECURITY_DEFEX
+	if (task_defex_enforce(current, NULL, -__NR_setfsgid))
+		return old_fsgid;
+#endif
 
 	new = prepare_creds();
 	if (!new)
@@ -1238,28 +1254,6 @@ static int override_release(char __user *release, size_t len)
 	return ret;
 }
 
-static int override_version(struct new_utsname __user *name)
-{
-#ifdef CONFIG_F2FS_REPORT_FAKE_KERNEL_VERSION
-	int ret;
-
-	if (strcmp(current->comm, "fsck.f2fs"))
-		return 0;
-
-	ret = copy_to_user(name->release, CONFIG_F2FS_FAKE_KERNEL_RELEASE,
-			   strlen(CONFIG_F2FS_FAKE_KERNEL_RELEASE) + 1);
-	if (ret)
-		return ret;
-
-	ret = copy_to_user(name->version, CONFIG_F2FS_FAKE_KERNEL_VERSION,
-			   strlen(CONFIG_F2FS_FAKE_KERNEL_VERSION) + 1);
-
-	return ret;
-#else
-	return 0;
-#endif
-}
-
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
 	struct new_utsname tmp;
@@ -1267,17 +1261,12 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 	down_read(&uts_sem);
 	memcpy(&tmp, utsname(), sizeof(tmp));
 	up_read(&uts_sem);
-#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-	susfs_spoof_uname(&tmp);
-#endif
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;
 
 	if (override_release(name->release, sizeof(name->release)))
 		return -EFAULT;
 	if (override_architecture(name))
-		return -EFAULT;
-	if (override_version(name))
 		return -EFAULT;
 	return 0;
 }
@@ -2658,6 +2647,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 	case PR_SET_VMA:
 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
+		break;
+	case PR_SET_TAGGED_ADDR_CTRL:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = SET_TAGGED_ADDR_CTRL(arg2);
+		break;
+	case PR_GET_TAGGED_ADDR_CTRL:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = GET_TAGGED_ADDR_CTRL();
 		break;
 	default:
 		error = -EINVAL;

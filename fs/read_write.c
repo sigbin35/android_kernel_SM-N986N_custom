@@ -29,6 +29,10 @@
 #include <linux/fscrypto_sdp_cache.h>
 #endif
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 const struct file_operations generic_ro_fops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= generic_file_read_iter,
@@ -438,20 +442,9 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
 }
 EXPORT_SYMBOL(kernel_read);
 
-#if (defined CONFIG_KSU && !defined CONFIG_KPROBES)
-extern bool ksu_vfs_read_hook __read_mostly;
-extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
-			size_t *count_ptr, loff_t **pos);
-#endif
-
 ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
 	ssize_t ret;
-
-#if (defined CONFIG_KSU && !defined CONFIG_KPROBES)
-	if (unlikely(ksu_vfs_read_hook))
-		ksu_handle_vfs_read(&file, &buf, &count, &pos);
-#endif
 
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
@@ -577,6 +570,10 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 	ret = rw_verify_area(WRITE, file, pos, count);
 	if (!ret) {
+#ifdef CONFIG_SECURITY_DEFEX
+		if (task_defex_enforce(current, file, -__NR_write))
+			return -EPERM;
+#endif
 		if (count > MAX_RW_COUNT)
 			count =  MAX_RW_COUNT;
 		file_start_write(file);
@@ -965,34 +962,6 @@ out:
 	return ret;
 }
 
-ssize_t vfs_iocb_iter_read(struct file *file, struct kiocb *iocb,
-			   struct iov_iter *iter)
-{
-	size_t tot_len;
-	ssize_t ret = 0;
-
-	if (!file->f_op->read_iter)
-		return -EINVAL;
-	if (!(file->f_mode & FMODE_READ))
-		return -EBADF;
-	if (!(file->f_mode & FMODE_CAN_READ))
-		return -EINVAL;
-
-	tot_len = iov_iter_count(iter);
-	if (!tot_len)
-		goto out;
-	ret = rw_verify_area(READ, file, &iocb->ki_pos, tot_len);
-	if (ret < 0)
-		return ret;
-
-	ret = call_read_iter(file, iocb, iter);
-out:
-	if (ret >= 0)
-		fsnotify_access(file);
-	return ret;
-}
-EXPORT_SYMBOL(vfs_iocb_iter_read);
-
 ssize_t vfs_iter_read(struct file *file, struct iov_iter *iter, loff_t *ppos,
 		rwf_t flags)
 {
@@ -1028,34 +997,6 @@ static ssize_t do_iter_write(struct file *file, struct iov_iter *iter,
 		fsnotify_modify(file);
 	return ret;
 }
-
-ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
-			    struct iov_iter *iter)
-{
-	size_t tot_len;
-	ssize_t ret = 0;
-
-	if (!file->f_op->write_iter)
-		return -EINVAL;
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EBADF;
-	if (!(file->f_mode & FMODE_CAN_WRITE))
-		return -EINVAL;
-
-	tot_len = iov_iter_count(iter);
-	if (!tot_len)
-		return 0;
-	ret = rw_verify_area(WRITE, file, &iocb->ki_pos, tot_len);
-	if (ret < 0)
-		return ret;
-
-	ret = call_write_iter(file, iocb, iter);
-	if (ret > 0)
-		fsnotify_modify(file);
-
-	return ret;
-}
-EXPORT_SYMBOL(vfs_iocb_iter_write);
 
 ssize_t vfs_iter_write(struct file *file, struct iov_iter *iter, loff_t *ppos,
 		rwf_t flags)

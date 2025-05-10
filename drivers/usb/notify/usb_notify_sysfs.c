@@ -75,10 +75,15 @@ usb_hw_param_print[USB_CCIC_HW_PARAM_MAX][MAX_HWPARAM_STRING] = {
 	{"F_CNT"},
 	{"CC_KILLER"},
 	{"CC_FWERR"},
+	{"M_B12RS"},
+	{"CC_PRS"},
+	{"CC_DRS"},
 	{"C_ARP"},
+	{"H_SB"},
+	{"H_OAD"},
 	{"CC_VER"},
 };
-#endif
+#endif /* CONFIG_USB_HW_PARAM */
 
 struct notify_data {
 	struct class *usb_notify_class;
@@ -492,13 +497,24 @@ error:
 	return ret;
 }
 
+static int is_skip_list(struct otg_notify *n, int index)
+{
+	if (!n)
+		return 0;
+
+	if (n->is_skip_list)
+		return n->is_skip_list(index);
+
+	return 0;
+}
+
 static ssize_t hw_param_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct usb_notify_dev *udev = (struct usb_notify_dev *)
 		dev_get_drvdata(dev);
 	struct otg_notify *n = udev->o_notify;
-	int index, ret = 0;
+	int index = 0, ret = 0;
 	unsigned long long *p_param = NULL;
 
 	if (udev->fp_hw_param_manager) {
@@ -540,41 +556,49 @@ static ssize_t hw_param_show(struct device *dev,
 			*p_param += udev->fp_hw_param_manager
 					(USB_CCIC_WATER_LPM_VBUS_TIME_DURATION);
 	}
-	p_param = get_hw_param(n, USB_CCIC_VERSION);
-	if (p_param)
-		*p_param = show_ccic_version();
-	for (index = 0; index < USB_CCIC_HW_PARAM_MAX - 1; index++) {
-		p_param = get_hw_param(n, index);
+	if (!is_skip_list(n, USB_CCIC_VERSION)) {
+		p_param = get_hw_param(n, USB_CCIC_VERSION);
 		if (p_param)
-			ret += sprintf(buf + ret, "\"%s\":\"%llu\",",
-				usb_hw_param_print[index], *p_param);
-		else
-			ret += sprintf(buf + ret, "\"%s\":\"0\",",
-				usb_hw_param_print[index]);
+			*p_param = show_ccic_version();
 	}
-	/* CCIC FW version */
-	ret += sprintf(buf + ret, "\"%s\":\"",
-		usb_hw_param_print[index]);
-	p_param = get_hw_param(n, index);
-	if (p_param) {
-		/* HW Version */
-		ret += sprintf(buf + ret, "%02X%02X%02X%02X",
-			*((unsigned char *)p_param + 3),
-			*((unsigned char *)p_param + 2),
-			*((unsigned char *)p_param + 1),
-			*((unsigned char *)p_param));
-		/* SW Main Version */
-		ret += sprintf(buf + ret, "%02X%02X%02X",
-			*((unsigned char *)p_param + 6),
-			*((unsigned char *)p_param + 5),
-			*((unsigned char *)p_param + 4));
-		/* SW Boot Version */
-		ret += sprintf(buf + ret, "%02X",
-			*((unsigned char *)p_param + 7));
-		ret += sprintf(buf + ret, "\"\n");
-	} else
-		ret += sprintf(buf + ret, "0000000000000000\"\n");
-
+	for (index = 0; index < USB_CCIC_HW_PARAM_MAX - 1; index++) {
+		if (!is_skip_list(n, index)) {
+			p_param = get_hw_param(n, index);
+			if (p_param)
+				ret += sprintf(buf + ret, "\"%s\":\"%llu\",",
+					usb_hw_param_print[index], *p_param);
+			else
+				ret += sprintf(buf + ret, "\"%s\":\"0\",",
+					usb_hw_param_print[index]);
+		}
+	}
+	if (!is_skip_list(n, USB_CCIC_VERSION)) {
+		/* CCIC FW version */
+		ret += sprintf(buf + ret, "\"%s\":\"",
+			usb_hw_param_print[USB_CCIC_VERSION]);
+		p_param = get_hw_param(n, USB_CCIC_VERSION);
+		if (p_param) {
+			/* HW Version */
+			ret += sprintf(buf + ret, "%02X%02X%02X%02X",
+				*((unsigned char *)p_param + 3),
+				*((unsigned char *)p_param + 2),
+				*((unsigned char *)p_param + 1),
+				*((unsigned char *)p_param));
+			/* SW Main Version */
+			ret += sprintf(buf + ret, "%02X%02X%02X",
+				*((unsigned char *)p_param + 6),
+				*((unsigned char *)p_param + 5),
+				*((unsigned char *)p_param + 4));
+			/* SW Boot Version */
+			ret += sprintf(buf + ret, "%02X",
+				*((unsigned char *)p_param + 7));
+			ret += sprintf(buf + ret, "\"\n");
+		} else {
+			ret += sprintf(buf + ret, "0000000000000000\"\n");
+		}
+	} else {
+		ret += sprintf(buf + ret - 1, "\n");
+	}
 	pr_info("%s - ret : %d\n", __func__, ret);
 	return ret;
 }
@@ -808,6 +832,57 @@ err:
 }
 EXPORT_SYMBOL_GPL(usb_notify_dev_uevent);
 
+static ssize_t usb_sl_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct usb_notify_dev *udev = (struct usb_notify_dev *)
+		dev_get_drvdata(dev);
+
+	if (udev == NULL) {
+		pr_err("udev is NULL\n");
+		return -EINVAL;
+	}
+	pr_info("%s secure_lock = %lu\n",
+		__func__, udev->secure_lock);
+
+	return sprintf(buf, "%lu\n", udev->secure_lock);
+}
+
+static ssize_t usb_sl_store(
+		struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t size)
+
+{
+	struct usb_notify_dev *udev = (struct usb_notify_dev *)
+		dev_get_drvdata(dev);
+	unsigned long secure_lock = 0;
+	int sret = -EINVAL;
+	size_t ret = -ENOMEM;
+
+	if (udev == NULL) {
+		pr_err("udev is NULL\n");
+		return -EINVAL;
+	}
+	if (size > PAGE_SIZE) {
+		pr_err("%s size(%zu) is too long.\n", __func__, size);
+		goto error;
+	}
+
+	sret = sscanf(buf, "%lu", &secure_lock);
+	if (sret != 1)
+		goto error;
+
+	udev->secure_lock = secure_lock;
+	udev->set_lock_state(udev);
+
+	pr_info("%s secure_lock = %lu\n",
+		__func__, udev->secure_lock);
+	ret = size;
+
+error:
+	return ret;
+}
+
 static DEVICE_ATTR_RW(disable);
 static DEVICE_ATTR_RW(usb_data_enabled);
 static DEVICE_ATTR_RO(support);
@@ -819,6 +894,7 @@ static DEVICE_ATTR_RO(cards);
 static DEVICE_ATTR_RW(usb_hw_param);
 static DEVICE_ATTR_RW(hw_param);
 #endif
+static DEVICE_ATTR_RW(usb_sl);
 
 static struct attribute *usb_notify_attrs[] = {
 	&dev_attr_disable.attr,
@@ -832,6 +908,7 @@ static struct attribute *usb_notify_attrs[] = {
 	&dev_attr_usb_hw_param.attr,
 	&dev_attr_hw_param.attr,
 #endif
+	&dev_attr_usb_sl.attr,
 	NULL,
 };
 

@@ -294,6 +294,17 @@
 			HWIO_REO_R0_GENERAL_ENABLE_ADDR( \
 			SEQ_WCSS_UMAC_REO_REG_OFFSET), \
 			(reg_val)); \
+		reg_val = \
+			HAL_REG_READ((soc), \
+				     HWIO_REO_R0_GENERAL_ENABLE_ADDR(	\
+				     SEQ_WCSS_UMAC_REO_REG_OFFSET)); \
+		reg_val &= \
+			(~HWIO_REO_R0_GENERAL_ENABLE_BAR_DEST_RING_BMSK |\
+				(REO_REMAP_TCL << HWIO_REO_R0_GENERAL_ENABLE_BAR_DEST_RING_SHFT)); \
+		HAL_REG_WRITE((soc), \
+			      HWIO_REO_R0_GENERAL_ENABLE_ADDR( \
+			      SEQ_WCSS_UMAC_REO_REG_OFFSET), \
+			      (reg_val)); \
 	} while (0)
 
 #define HAL_RX_MSDU_DESC_INFO_GET(msdu_details_ptr) \
@@ -543,7 +554,9 @@ static void hal_rx_dump_msdu_start_tlv_6390(void *msdustart, uint8_t dbg_level)
  * Return: void
  */
 static void hal_rx_dump_msdu_end_tlv_6390(void *msduend,
-					  uint8_t dbg_level) {
+					  uint8_t dbg_level)
+{
+	struct rx_msdu_end *msdu_end = (struct rx_msdu_end *)msduend;
 
 	__QDF_TRACE_RL(dbg_level, QDF_MODULE_ID_DP,
 		       "rx_msdu_end tlv (1/2) - "

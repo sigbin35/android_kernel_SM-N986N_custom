@@ -53,10 +53,18 @@ struct msg_msg;
 struct xattr;
 struct xfrm_sec_ctx;
 struct mm_struct;
+#ifdef CONFIG_KDP_CRED
+/* For understanding size of struct cred*/
+#include <linux/rkp.h>
+#include <linux/kdp.h>
+#endif
 
+/* Default (no) options for the capable function */
+#define CAP_OPT_NONE 0x0
 /* If capable should audit the security request */
-#define SECURITY_CAP_NOAUDIT 0
-#define SECURITY_CAP_AUDIT 1
+#define CAP_OPT_NOAUDIT BIT(1)
+/* If capable is being called by a setid function */
+#define CAP_OPT_INSETID BIT(2)
 
 /* LSM Agnostic defines for sb_set_mnt_opts */
 #define SECURITY_LSM_NATIVE_LABELS	1
@@ -70,9 +78,13 @@ enum lsm_event {
 	LSM_POLICY_CHANGE,
 };
 
+#ifndef CONFIG_KDP_CRED
+#define security_integrity_current()  0
+#endif
+
 /* These functions are in security/commoncap.c */
 extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
-		       int cap, int audit);
+		       int cap, unsigned int opts);
 extern int cap_settime(const struct timespec64 *ts, const struct timezone *tz);
 extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
 extern int cap_ptrace_traceme(struct task_struct *parent);
@@ -233,10 +245,10 @@ int security_capset(struct cred *new, const struct cred *old,
 		    const kernel_cap_t *effective,
 		    const kernel_cap_t *inheritable,
 		    const kernel_cap_t *permitted);
-int security_capable(const struct cred *cred, struct user_namespace *ns,
-			int cap);
-int security_capable_noaudit(const struct cred *cred, struct user_namespace *ns,
-			     int cap);
+int security_capable(const struct cred *cred,
+		       struct user_namespace *ns,
+		       int cap,
+		       unsigned int opts);
 int security_quotactl(int cmds, int type, int id, struct super_block *sb);
 int security_quota_on(struct dentry *dentry);
 int security_syslog(int type);
@@ -492,14 +504,11 @@ static inline int security_capset(struct cred *new,
 }
 
 static inline int security_capable(const struct cred *cred,
-				   struct user_namespace *ns, int cap)
+				   struct user_namespace *ns,
+				   int cap,
+				   unsigned int opts)
 {
-	return cap_capable(cred, ns, cap, SECURITY_CAP_AUDIT);
-}
-
-static inline int security_capable_noaudit(const struct cred *cred,
-					   struct user_namespace *ns, int cap) {
-	return cap_capable(cred, ns, cap, SECURITY_CAP_NOAUDIT);
+	return cap_capable(cred, ns, cap, opts);
 }
 
 static inline int security_quotactl(int cmds, int type, int id,
@@ -1850,6 +1859,7 @@ static inline void free_secdata(void *secdata)
 
 #ifdef CONFIG_PERF_EVENTS
 struct perf_event_attr;
+struct perf_event;
 
 #ifdef CONFIG_SECURITY
 extern int security_perf_event_open(struct perf_event_attr *attr, int type);

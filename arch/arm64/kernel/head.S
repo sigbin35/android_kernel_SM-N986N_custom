@@ -44,6 +44,9 @@
 #include <asm/virt.h>
 
 #include "efi-header.S"
+#ifdef CONFIG_CFP_ROPP
+#include <asm/cfp.h>
+#endif
 
 #define __PHYS_OFFSET	(KERNEL_START - TEXT_OFFSET)
 
@@ -90,7 +93,11 @@ _head:
 	le64sym	_kernel_size_le			// Effective size of kernel image, little-endian
 	le64sym	_kernel_flags_le		// Informative flags, little-endian
 	.quad	0				// reserved
-	.quad	0				// reserved
+#ifdef CONFIG_PROCA
+	le64sym	_proca_conf_offset		// memory info for proca ta
+#else
+	.quad	0xecefecef			// Magic number for proca ta
+#endif
 	.quad	0				// reserved
 	.ascii	"ARM\x64"			// Magic number
 #ifdef CONFIG_EFI
@@ -117,6 +124,9 @@ pe_header:
 	 *                                        current RELR displacement
 	 */
 ENTRY(stext)
+#ifdef CONFIG_CFP_ROPP
+	ropp_primary_early_init
+#endif
 	bl	preserve_boot_args
 	bl	el2_setup			// Drop to EL1, w0=cpu_boot_mode
 	adrp	x23, __PHYS_OFFSET
@@ -715,6 +725,7 @@ secondary_startup:
 	/*
 	 * Common entry point for secondary CPUs.
 	 */
+	bl	__cpu_secondary_check52bitva
 	bl	__cpu_setup			// initialise processor
 	bl	__enable_mmu
 	ldr	x8, =__secondary_switched
@@ -731,6 +742,9 @@ __secondary_switched:
 	mov	sp, x1
 	ldr	x2, [x0, #CPU_BOOT_TASK]
 	msr	sp_el0, x2
+#ifdef CONFIG_CFP_ROPP
+	ropp_secondary_init x2
+#endif
 #ifdef CONFIG_SHADOW_CALL_STACK
 	ldr	x18, [x2, #TSK_TI_SCS]		// set shadow call stack
 	str	xzr, [x2, #TSK_TI_SCS]		// limit visibility of saved SCS
@@ -794,6 +808,31 @@ ENTRY(__enable_mmu)
 	isb
 	ret
 ENDPROC(__enable_mmu)
+
+ENTRY(__cpu_secondary_check52bitva)
+#ifdef CONFIG_ARM64_52BIT_VA
+	ldr_l	x0, vabits_user
+	cmp	x0, #52
+	b.ne	2f
+
+	mrs_s	x0, SYS_ID_AA64MMFR2_EL1
+	and	x0, x0, #(0xf << ID_AA64MMFR2_LVA_SHIFT)
+	cbnz	x0, 2f
+
+	adr_l	x0, va52mismatch
+	mov	w1, #1
+	strb	w1, [x0]
+	dmb	sy
+	dc	ivac, x0	// Invalidate potentially stale cache line
+
+	update_early_cpu_boot_status CPU_STUCK_IN_KERNEL, x0, x1
+1:	wfe
+	wfi
+	b	1b
+
+#endif
+2:	ret
+ENDPROC(__cpu_secondary_check52bitva)
 
 __no_granule_support:
 	/* Indicate that this CPU can't boot and is stuck in the kernel */

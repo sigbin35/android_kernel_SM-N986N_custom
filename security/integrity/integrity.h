@@ -62,12 +62,12 @@ enum five_file_integrity {
 #define IMA_BPRM_APPRAISED	0x00020000
 #define IMA_READ_APPRAISE	0x00040000
 #define IMA_READ_APPRAISED	0x00080000
-#define IMA_CREDS_APPRAISE	0x00100000
-#define IMA_CREDS_APPRAISED	0x00200000
 
 #define FIVE_DMVERITY_PROTECTED	0x00040000
 #define FIVE_TRUSTED_FILE	0x00080000
 
+#define IMA_CREDS_APPRAISE	0x00100000
+#define IMA_CREDS_APPRAISED	0x00200000
 #define IMA_APPRAISE_SUBMASK	(IMA_FILE_APPRAISE | IMA_MMAP_APPRAISE | \
 				 IMA_BPRM_APPRAISE | IMA_READ_APPRAISE | \
 				 IMA_CREDS_APPRAISE)
@@ -143,6 +143,12 @@ struct integrity_iint_cache {
 	enum integrity_status ima_creds_status:4;
 	enum integrity_status evm_status:4;
 	struct ima_digest_data *ima_hash;
+#ifdef CONFIG_FIVE
+	unsigned long five_flags;
+	enum five_file_integrity five_status;
+	struct integrity_label *five_label;
+	bool five_signing;
+#endif
 };
 
 /* rbtree tree calls to lookup, insert, delete
@@ -158,7 +164,6 @@ int integrity_kernel_read(struct file *file, loff_t offset,
 #define INTEGRITY_KEYRING_MODULE	2
 #define INTEGRITY_KEYRING_FIVE		3
 #define INTEGRITY_KEYRING_MAX		4
-
 extern struct dentry *integrity_dir;
 
 #ifdef CONFIG_INTEGRITY_SIGNATURE

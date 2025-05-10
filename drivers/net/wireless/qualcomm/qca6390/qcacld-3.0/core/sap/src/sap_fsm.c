@@ -1078,7 +1078,6 @@ static QDF_STATUS sap_clear_global_dfs_param(mac_handle_t mac_handle)
 	}
 	mac_ctx->sap.SapDfsInfo.cac_state = eSAP_DFS_DO_NOT_SKIP_CAC;
 	sap_cac_reset_notify(mac_handle);
-	qdf_mem_zero(&mac_ctx->sap, sizeof(mac_ctx->sap));
 
 	return QDF_STATUS_SUCCESS;
 }
@@ -1165,11 +1164,9 @@ QDF_STATUS sap_clear_session_param(mac_handle_t mac_handle,
 		QDF_MAX_NO_OF_MODE;
 	sap_clear_global_dfs_param(mac_handle);
 	sap_free_roam_profile(&sapctx->csr_roamProfile);
+	sap_err("Set sapCtxList null for session %d", sapctx->sessionId);
 	qdf_mem_zero(sapctx, sizeof(*sapctx));
 	sapctx->sessionId = WLAN_UMAC_VDEV_ID_MAX;
-	QDF_TRACE(QDF_MODULE_ID_SAP, QDF_TRACE_LEVEL_DEBUG,
-		"%s: Initializing State: %d, sap_ctx value = %pK", __func__,
-		sapctx->fsm_state, sapctx);
 
 	return QDF_STATUS_SUCCESS;
 }
@@ -1466,7 +1463,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 			return QDF_STATUS_E_INVAL;
 		}
 
-		bss_complete->status = (eSapStatus)(long)context;
+		bss_complete->status = (eSapStatus) context;
 		bss_complete->staId = sap_ctx->sap_sta_id;
 
 		QDF_TRACE(QDF_MODULE_ID_SAP, QDF_TRACE_LEVEL_INFO_HIGH,
@@ -1485,16 +1482,16 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 	case eSAP_DFS_NO_AVAILABLE_CHANNEL:
 		sap_ap_event.sapHddEventCode = sap_hddevent;
 		sap_ap_event.sapevt.sapStopBssCompleteEvent.status =
-			(eSapStatus)(long)context;
+			(eSapStatus) context;
 		break;
 	case eSAP_ACS_SCAN_SUCCESS_EVENT:
 		sap_handle_acs_scan_event(sap_ctx, &sap_ap_event,
-			(eSapStatus)(long)context);
+			(eSapStatus)context);
 		break;
 	case eSAP_ACS_CHANNEL_SELECTED:
 		sap_ap_event.sapHddEventCode = sap_hddevent;
 		acs_selected = &sap_ap_event.sapevt.sap_ch_selected;
-		if (eSAP_STATUS_SUCCESS == (eSapStatus)(long)context) {
+		if (eSAP_STATUS_SUCCESS == (eSapStatus)context) {
 			acs_selected->pri_ch_freq =
 						sap_ctx->acs_cfg->pri_ch_freq;
 			acs_selected->ht_sec_ch_freq =
@@ -1504,7 +1501,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 				sap_ctx->acs_cfg->vht_seg0_center_ch_freq;
 			acs_selected->vht_seg1_center_ch_freq =
 				sap_ctx->acs_cfg->vht_seg1_center_ch_freq;
-		} else if (eSAP_STATUS_FAILURE == (eSapStatus)(long)context) {
+		} else if (eSAP_STATUS_FAILURE == (eSapStatus)context) {
 			acs_selected->pri_ch_freq = 0;
 		}
 		break;
@@ -1512,7 +1509,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 	case eSAP_STOP_BSS_EVENT:
 		sap_ap_event.sapHddEventCode = eSAP_STOP_BSS_EVENT;
 		sap_ap_event.sapevt.sapStopBssCompleteEvent.status =
-			(eSapStatus)(long)context;
+			(eSapStatus) context;
 		break;
 
 	case eSAP_STA_ASSOC_EVENT:
@@ -1586,7 +1583,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 		chaninfo->rate_flags = csr_roaminfo->chan_info.rate_flags;
 
 		reassoc_complete->wmmEnabled = csr_roaminfo->wmmEnabledSta;
-		reassoc_complete->status = (eSapStatus)(long)context;
+		reassoc_complete->status = (eSapStatus) context;
 		reassoc_complete->timingMeasCap = csr_roaminfo->timingMeasCap;
 		reassoc_complete->ampdu = csr_roaminfo->ampdu;
 		reassoc_complete->sgi_enable = csr_roaminfo->sgi_enable;
@@ -1630,7 +1627,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 			disassoc_comp->reason = eSAP_MAC_INITATED_DISASSOC;
 
 		disassoc_comp->status_code = csr_roaminfo->status_code;
-		disassoc_comp->status = (eSapStatus)(long)context;
+		disassoc_comp->status = (eSapStatus) context;
 		disassoc_comp->rssi = csr_roaminfo->rssi;
 		disassoc_comp->rx_rate = csr_roaminfo->rx_rate;
 		disassoc_comp->tx_rate = csr_roaminfo->tx_rate;
@@ -1649,7 +1646,7 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 		sap_ap_event.sapHddEventCode = eSAP_STA_SET_KEY_EVENT;
 		key_complete =
 			&sap_ap_event.sapevt.sapStationSetKeyCompleteEvent;
-		key_complete->status = (eSapStatus)(long)context;
+		key_complete->status = (eSapStatus) context;
 		qdf_copy_macaddr(&key_complete->peerMacAddr,
 				 &csr_roaminfo->peerMac);
 		break;
@@ -1699,13 +1696,13 @@ QDF_STATUS sap_signal_hdd_event(struct sap_context *sap_ctx,
 	case eSAP_DISCONNECT_ALL_P2P_CLIENT:
 		sap_ap_event.sapHddEventCode = eSAP_DISCONNECT_ALL_P2P_CLIENT;
 		sap_ap_event.sapevt.sapActionCnf.actionSendSuccess =
-			(eSapStatus)(long)context;
+			(eSapStatus) context;
 		break;
 
 	case eSAP_MAC_TRIG_STOP_BSS_EVENT:
 		sap_ap_event.sapHddEventCode = eSAP_MAC_TRIG_STOP_BSS_EVENT;
 		sap_ap_event.sapevt.sapActionCnf.actionSendSuccess =
-			(eSapStatus)(long)context;
+			(eSapStatus) context;
 		break;
 
 	case eSAP_UNKNOWN_STA_JOIN:
@@ -2473,6 +2470,43 @@ static QDF_STATUS sap_fsm_handle_start_failure(struct sap_context *sap_ctx,
 }
 
 /**
+ * sap_propagate_cac_events() - Indicate CAC START/END event
+ * @sap_ctx: SAP context
+ *
+ * This function is to indicate CAC START/END event if CAC process
+ * is skipped.
+ *
+ * Return: void
+ */
+static void sap_propagate_cac_events(struct sap_context *sap_ctx)
+{
+	QDF_STATUS qdf_status;
+
+	qdf_status = sap_signal_hdd_event(sap_ctx, NULL,
+					  eSAP_DFS_CAC_START,
+					  (void *)
+					  eSAP_STATUS_SUCCESS);
+	if (qdf_status != QDF_STATUS_SUCCESS) {
+		QDF_TRACE(QDF_MODULE_ID_SAP,
+			  QDF_TRACE_LEVEL_DEBUG,
+			  "failed to indicate CAC START vdev %d",
+			  sap_ctx->sessionId);
+		return;
+	}
+
+	qdf_status = sap_signal_hdd_event(sap_ctx, NULL,
+					  eSAP_DFS_CAC_END,
+					  (void *)
+					  eSAP_STATUS_SUCCESS);
+	if (qdf_status != QDF_STATUS_SUCCESS) {
+		QDF_TRACE(QDF_MODULE_ID_SAP,
+			  QDF_TRACE_LEVEL_DEBUG,
+			  "failed to indicate CAC End vdev %d",
+			  sap_ctx->sessionId);
+	}
+}
+
+/**
  * sap_fsm_state_starting() - utility function called from sap fsm
  * @sap_ctx: SAP context
  * @sap_event: SAP event buffer
@@ -2510,10 +2544,10 @@ static QDF_STATUS sap_fsm_state_starting(struct sap_context *sap_ctx,
 
 		if (sap_ctx->is_chan_change_inprogress) {
 			/* SAP channel change request processing is completed */
-			sap_ctx->is_chan_change_inprogress = false;
 			qdf_status = sap_signal_hdd_event(sap_ctx, roam_info,
 						eSAP_CHANNEL_CHANGE_EVENT,
 						(void *)eSAP_STATUS_SUCCESS);
+			sap_ctx->is_chan_change_inprogress = false;
 		} else {
 			/* Action code for transition */
 			qdf_status = sap_signal_hdd_event(sap_ctx, roam_info,
@@ -2577,6 +2611,16 @@ static QDF_STATUS sap_fsm_state_starting(struct sap_context *sap_ctx,
 				QDF_TRACE(QDF_MODULE_ID_SAP,
 					  QDF_TRACE_LEVEL_INFO_HIGH,
 					FL("skip cac timer"));
+				/*
+				 * If hostapd starts AP on dfs channel,
+				 * hostapd will wait for CAC START/CAC END
+				 * event and finish AP start process.
+				 * If we skip CAC timer, we will need to
+				 * indicate the CAC event even though driver
+				 * doesn't perform CAC.
+				 */
+				sap_propagate_cac_events(sap_ctx);
+
 				wlansap_start_beacon_req(sap_ctx);
 			}
 		}
@@ -2622,6 +2666,34 @@ static inline QDF_STATUS
 sap_fsm_send_csa_restart_req(struct mac_context *mac_ctx,
 			     struct sap_context *sap_ctx)
 {
+	QDF_STATUS status;
+
+	status = policy_mgr_check_and_set_hw_mode_for_channel_switch(
+				mac_ctx->psoc, sap_ctx->sessionId,
+				mac_ctx->sap.SapDfsInfo.target_chan_freq,
+				POLICY_MGR_UPDATE_REASON_CHANNEL_SWITCH_SAP);
+
+	/*
+	 * If hw_mode_status is QDF_STATUS_E_FAILURE, mean HW
+	 * mode change was required but driver failed to set HW
+	 * mode so ignore CSA for the channel.
+	 */
+	if (status == QDF_STATUS_E_FAILURE) {
+		sap_err("HW change required but failed to set hw mode");
+		return status;
+	}
+
+	/*
+	 * If hw_mode_status is QDF_STATUS_SUCCESS mean HW mode
+	 * change was required and was successfully requested so
+	 * the channel switch will continue after HW mode change
+	 * completion.
+	 */
+	if (QDF_IS_STATUS_SUCCESS(status)) {
+		sap_info("Channel change will continue after HW mode change");
+		return QDF_STATUS_SUCCESS;
+	}
+
 	return sme_csa_restart(mac_ctx, sap_ctx->sessionId);
 }
 
@@ -3427,7 +3499,7 @@ static QDF_STATUS sap_get_freq_list(struct sap_context *sap_ctx,
 			sap_debug("vdev opmode %d not allowed on SRD freq %d",
 				  vdev_opmode, WLAN_REG_CH_TO_FREQ(loop_count));
 			continue;
-	       }
+		}
 
 		/* Check if the freq is present in range list */
 		for (i = 0; i < mac_ctx->mlme_cfg->acs.num_weight_range; i++) {

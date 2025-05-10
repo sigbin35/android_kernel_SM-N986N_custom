@@ -512,6 +512,12 @@ struct skb_shared_info {
 	 * remains valid until skb destructor */
 	void *		destructor_arg;
 
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_VPN {
+	uid_t uid;
+	pid_t pid;
+	u_int32_t knox_mark;
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_VPN }
+
 	/* must be last field, see pskb_expand_head() */
 	skb_frag_t	frags[MAX_SKB_FRAGS];
 };
@@ -828,10 +834,6 @@ struct sk_buff {
 #endif
 #ifdef CONFIG_NETWORK_SECMARK
 	__u32		secmark;
-#endif
-
-#if defined(CONFIG_MODEM_IF_LEGACY_QOS) || defined(CONFIG_MODEM_IF_QOS)
-	__u32		priomark;
 #endif
 
 	union {
@@ -1371,11 +1373,6 @@ static inline void skb_mark_not_on_list(struct sk_buff *skb)
 	skb->next = NULL;
 }
 
-/* Iterate through singly-linked GSO fragments of an skb. */
-#define skb_list_walk_safe(first, skb, next)                                   \
-	for ((skb) = (first), (next) = (skb) ? (skb)->next : NULL; (skb);      \
-	     (skb) = (next), (next) = (skb) ? (skb)->next : NULL)
-
 static inline void skb_list_del_init(struct sk_buff *skb)
 {
 	__list_del_entry(&skb->list);
@@ -1682,7 +1679,7 @@ static inline struct sk_buff *skb_peek_next(struct sk_buff *skb,
  */
 static inline struct sk_buff *skb_peek_tail(const struct sk_buff_head *list_)
 {
-	struct sk_buff *skb = list_->prev;
+	struct sk_buff *skb = READ_ONCE(list_->prev);
 
 	if (skb == (struct sk_buff *)list_)
 		skb = NULL;
@@ -1750,7 +1747,9 @@ static inline void __skb_insert(struct sk_buff *newsk,
 				struct sk_buff *prev, struct sk_buff *next,
 				struct sk_buff_head *list)
 {
-	/* see skb_queue_empty_lockless() for the opposite READ_ONCE() */
+	/* See skb_queue_empty_lockless() and skb_peek_tail()
+	 * for the opposite READ_ONCE()
+	 */
 	WRITE_ONCE(newsk->next, next);
 	WRITE_ONCE(newsk->prev, prev);
 	WRITE_ONCE(next->prev, newsk);

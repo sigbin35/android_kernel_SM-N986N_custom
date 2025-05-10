@@ -89,6 +89,10 @@
 #include <linux/shm.h>
 #include <linux/bpf.h>
 
+// [ SEC_SELINUX_PORTING_COMMON
+#include <linux/delay.h>
+// ] SEC_SELINUX_PORTING_COMMON
+
 #include "avc.h"
 #include "objsec.h"
 #include "netif.h"
@@ -100,19 +104,128 @@
 #include "audit.h"
 #include "avc_ss.h"
 
-struct selinux_state selinux_state;
+
+struct selinux_state selinux_state __rticdata;
+
+#ifdef CONFIG_LOD_SEC
+#ifdef CONFIG_KDP_CRED
+#define rkp_is_lod_cred(x) ((x->type)>>3 & 1)
+#else
+#define rkp_is_lod_cred(x) (uid_is_LOD(x->uid.val) || (strcmp(current->comm, "nst") == 0 && x->uid.val == 0))
+#endif
+#endif
+
+#ifdef CONFIG_KDP_NS
+extern unsigned int cmp_ns_integrity(void);
+#else
+unsigned int cmp_ns_integrity(void)
+{
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_KDP_CRED
+struct task_security_struct init_sec __kdp_ro;
+extern struct kmem_cache *tsec_jar;
+extern void rkp_free_security(unsigned long tsec);
+extern u8 rkp_ro_page(unsigned long addr);
+
+static inline unsigned int cmp_sec_integrity(const struct cred *cred,struct mm_struct *mm)
+{
+	
+	if (cred->bp_task != current)
+		printk(KERN_ERR "KDP: cred->bp_task: %p, current: %p\n", 
+						cred->bp_task, current);
+
+	if (mm && (mm->pgd != cred->bp_pgd))
+		printk(KERN_ERR "KDP: mm: %p, mm->pgd: %p, cred->bp_pgd: %p\n", 
+						mm, mm->pgd, cred->bp_pgd);
+
+	return ((cred->bp_task != current) || 
+			(mm && (!( in_interrupt() || in_softirq())) && 
+			(cred->bp_pgd != swapper_pg_dir) &&
+			(mm->pgd != cred->bp_pgd)));
+			
+}
+
+extern struct cred init_cred;
+static inline unsigned int rkp_is_valid_cred_sp(u64 cred,u64 sp)
+{
+		struct task_security_struct *tsec = (struct task_security_struct *)sp;
+
+		if((cred == (u64)&init_cred) && 
+			( sp == (u64)&init_sec)){
+			return 0;
+		}
+		if (!rkp_ro_page(cred) || !rkp_ro_page(cred+sizeof(struct cred)) ||
+			(!rkp_ro_page(sp) || !rkp_ro_page(sp+sizeof(struct task_security_struct)))) {
+			printk(KERN_ERR, "KDP: rkp_ro_page: cred: %d, cred+sizeof(cred): %d, ", 
+							rkp_ro_page((u64)cred), rkp_ro_page((u64)cred+sizeof(struct cred)));
+			printk(KERN_ERR, "rkp_ro_page(sp): %d, sp+sizeof(task_security_struct): %d\n", 
+							rkp_ro_page(sp), rkp_ro_page(sp+sizeof(struct task_security_struct))); 
+			return 1;
+		}
+		if ((u64)tsec->bp_cred != cred) {
+			printk(KERN_ERR, "KDP: tesc->bp_cred: %p, cred: %p\n", 
+							(u64)tsec->bp_cred, cred);
+			return 1;
+		}
+		return 0;
+}
+
+/* Main function to verify cred security context of a process */
+int security_integrity_current(void)
+{
+	rcu_read_lock();
+	if ( rkp_cred_enable && 
+		(rkp_is_valid_cred_sp((u64)current_cred(),(u64)current_cred()->security)||
+		cmp_sec_integrity(current_cred(),current->mm)||
+		cmp_ns_integrity())) {
+		rcu_read_unlock();
+		panic("RKP CRED PROTECTION VIOLATION\n");
+	}
+	rcu_read_unlock();
+	return 0;
+}
+unsigned int rkp_get_task_sec_size(void)
+{
+	return sizeof(struct task_security_struct);
+}
+u32 rkp_get_offset_bp_cred(void)
+{
+	return offsetof(struct task_security_struct,bp_cred);
+}
+#endif
 
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
 
+// [ SEC_SELINUX_PORTING_COMMON
+static DEFINE_MUTEX(selinux_sdcardfs_lock);
+// ] SEC_SELINUX_PORTING_COMMON
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+#if (defined CONFIG_KDP_CRED && defined CONFIG_SAMSUNG_PRODUCT_SHIP)
+static int selinux_enforcing_boot __kdp_ro;
+int selinux_enforcing __kdp_ro;
+#else
 static int selinux_enforcing_boot;
+int selinux_enforcing;
+#endif
 
 static int __init enforcing_setup(char *str)
 {
 	unsigned long enforcing;
-	if (!kstrtoul(str, 0, &enforcing)) {
+	if (!kstrtoul(str, 0, &enforcing))
+	{
+// [ SEC_SELINUX_PORTING_COMMON
+#ifdef CONFIG_ALWAYS_ENFORCE
+		selinux_enforcing_boot = 1;
+		selinux_enforcing = 1;
+#else
 		selinux_enforcing_boot = enforcing ? 1 : 0;
+		selinux_enforcing = enforcing ? 1 : 0;
+#endif
+// ] SEC_SELINUX_PORTING_COMMON
 	}
 	return 1;
 }
@@ -122,18 +235,32 @@ __setup("enforcing=", enforcing_setup);
 #endif
 
 #ifdef CONFIG_SECURITY_SELINUX_BOOTPARAM
+#if (defined CONFIG_KDP_CRED && defined CONFIG_SAMSUNG_PRODUCT_SHIP)
+int selinux_enabled __kdp_ro = CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE;
+#else
 int selinux_enabled = CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE;
+#endif
 
 static int __init selinux_enabled_setup(char *str)
 {
 	unsigned long enabled;
 	if (!kstrtoul(str, 0, &enabled))
+// [ SEC_SELINUX_PORTING_COMMON
+#ifdef CONFIG_ALWAYS_ENFORCE
+		selinux_enabled = 1;
+#else
 		selinux_enabled = enabled ? 1 : 0;
+#endif
+// ] SEC_SELINUX_PORTING_COMMON
 	return 1;
 }
 __setup("selinux=", selinux_enabled_setup);
 #else
+#if (defined CONFIG_KDP_CRED && defined CONFIG_SAMSUNG_PRODUCT_SHIP)
+int selinux_enabled __kdp_ro = 1;
+#else
 int selinux_enabled = 1;
+#endif
 #endif
 
 static unsigned int selinux_checkreqprot_boot =
@@ -213,9 +340,14 @@ static void cred_init_security(void)
 {
 	struct cred *cred = (struct cred *) current->real_cred;
 	struct task_security_struct *tsec;
+#ifdef CONFIG_KDP_CRED
+	tsec = &init_sec;
+	tsec->bp_cred = cred;
+#else
 	tsec = kzalloc(sizeof(struct task_security_struct), GFP_KERNEL);
 	if (!tsec)
 		panic("SELinux:  Failed to initialize initial task.\n");
+#endif
 	tsec->osid = tsec->sid = SECINITSID_KERNEL;
 	cred->security = tsec;
 }
@@ -283,7 +415,7 @@ static int __inode_security_revalidate(struct inode *inode,
 
 	might_sleep_if(may_sleep);
 
-	if (selinux_state.initialized &&
+	if (ss_initialized && // SEC_SELINUX_PORTING_COMMON Change to use RKP
 	    isec->initialized != LABEL_INITIALIZED) {
 		if (!may_sleep)
 			return -ECHILD;
@@ -632,7 +764,7 @@ static int selinux_get_mnt_opts(const struct super_block *sb,
 	if (!(sbsec->flags & SE_SBINITIALIZED))
 		return -EINVAL;
 
-	if (!selinux_state.initialized)
+	if (!ss_initialized) // SEC_SELINUX_PORTING_COMMON Change to use RKP
 		return -EINVAL;
 
 	/* make sure we always check enough bits to cover the mask */
@@ -755,7 +887,7 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	mutex_lock(&sbsec->lock);
 
-	if (!selinux_state.initialized) {
+	if (!ss_initialized) { // SEC_SELINUX_PORTING_COMMON Change to use RKP
 		if (!num_opts) {
 			/* Defer initialization until selinux_complete_init,
 			   after the initial policy is loaded and the security
@@ -869,9 +1001,12 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	if (!strcmp(sb->s_type->name, "debugfs") ||
 	    !strcmp(sb->s_type->name, "tracefs") ||
 	    !strcmp(sb->s_type->name, "sysfs") ||
+// [ SEC_SELINUX_PORTING_COMMON
+		!strcmp(sb->s_type->name, "configfs") ||
+// ] SEC_SELINUX_PORTING_COMMON
 	    !strcmp(sb->s_type->name, "pstore") ||
-		!strcmp(sb->s_type->name, "binder") ||
 	    !strcmp(sb->s_type->name, "bpf") ||
+	    !strcmp(sb->s_type->name, "binder") ||
 	    !strcmp(sb->s_type->name, "cgroup") ||
 	    !strcmp(sb->s_type->name, "cgroup2"))
 		sbsec->flags |= SE_SBGENFS;
@@ -1044,7 +1179,7 @@ static int selinux_sb_clone_mnt_opts(const struct super_block *oldsb,
 	 * mount options.  thus we can safely deal with this superblock later
 	 */
  
-	if (!selinux_state.initialized)
+	if (!ss_initialized) // SEC_SELINUX_PORTING_COMMON Change to use RKP
 		return 0;
 
 	/*
@@ -1796,7 +1931,7 @@ static inline u32 signal_to_av(int sig)
 
 /* Check whether a task is allowed to use a capability. */
 static int cred_has_capability(const struct cred *cred,
-			       int cap, int audit, bool initns)
+			       int cap, unsigned int opts, bool initns)
 {
 	struct common_audit_data ad;
 	struct av_decision avd;
@@ -1823,7 +1958,7 @@ static int cred_has_capability(const struct cred *cred,
 
 	rc = avc_has_perm_noaudit(&selinux_state,
 				  sid, sid, sclass, av, 0, &avd);
-	if (audit == SECURITY_CAP_AUDIT) {
+	if (!(opts & CAP_OPT_NOAUDIT)) {
 		int rc2 = avc_audit(&selinux_state,
 				    sid, sid, sclass, av, &avd, rc, &ad, 0);
 		if (rc2)
@@ -2337,9 +2472,9 @@ static int selinux_capset(struct cred *new, const struct cred *old,
  */
 
 static int selinux_capable(const struct cred *cred, struct user_namespace *ns,
-			   int cap, int audit)
+			   int cap, unsigned int opts)
 {
-	return cred_has_capability(cred, cap, audit, ns == &init_user_ns);
+	return cred_has_capability(cred, cap, opts, ns == &init_user_ns);
 }
 
 static int selinux_quotactl(int cmds, int type, int id, struct super_block *sb)
@@ -2413,7 +2548,7 @@ static int selinux_vm_enough_memory(struct mm_struct *mm, long pages)
 	int rc, cap_sys_admin = 0;
 
 	rc = cred_has_capability(current_cred(), CAP_SYS_ADMIN,
-				 SECURITY_CAP_NOAUDIT, true);
+				 CAP_OPT_NOAUDIT, true);
 	if (rc == 0)
 		cap_sys_admin = 1;
 
@@ -2440,30 +2575,17 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 			    const struct task_security_struct *old_tsec,
 			    const struct task_security_struct *new_tsec)
 {
-	static u32 ksu_sid;
-	char *secdata;
 	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
 	int nosuid = !mnt_may_suid(bprm->file->f_path.mnt);
-	int rc,error;
+	int rc;
 	u32 av;
-	u32 seclen;
 
 	if (!nnp && !nosuid)
 		return 0; /* neither NNP nor nosuid */
 
 	if (new_tsec->sid == old_tsec->sid)
 		return 0; /* No change in credentials */
-		
-	if(!ksu_sid)
-		security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &ksu_sid);
 
-	error = security_secid_to_secctx(old_tsec->sid, &secdata, &seclen);
-	if (!error) {
-		rc = strcmp("u:r:init:s0",secdata);
-		security_release_secctx(secdata, seclen);
-		if(rc == 0 && new_tsec->sid == ksu_sid)
-			return 0;
-	}
 	/*
 	 * If the policy enables the nnp_nosuid_transition policy capability,
 	 * then we permit transitions under NNP or nosuid if the
@@ -2963,17 +3085,29 @@ static int selinux_sb_kern_mount(struct super_block *sb, int flags, void *data)
 	struct common_audit_data ad;
 	int rc;
 
+
+	// [ SEC_SELINUX_PORTING_COMMON
+	if((strcmp(sb->s_type->name,"sdcardfs")) == 0)
+		mutex_lock(&selinux_sdcardfs_lock);
+
 	rc = superblock_doinit(sb, data);
 	if (rc)
-		return rc;
+		goto out;
 
 	/* Allow all mounts performed by the kernel */
 	if (flags & (MS_KERNMOUNT | MS_SUBMOUNT))
-		return 0;
+		goto out;
 
 	ad.type = LSM_AUDIT_DATA_DENTRY;
 	ad.u.dentry = sb->s_root;
-	return superblock_has_perm(cred, sb, FILESYSTEM__MOUNT, &ad);
+	rc = superblock_has_perm(cred, sb, FILESYSTEM__MOUNT, &ad);
+
+out:
+	if((strcmp(sb->s_type->name,"sdcardfs")) == 0)
+		mutex_unlock(&selinux_sdcardfs_lock);
+	// ] SEC_SELINUX_PORTING_COMMON
+	
+	return rc;
 }
 
 static int selinux_sb_statfs(struct dentry *dentry)
@@ -3090,7 +3224,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 		isec->initialized = LABEL_INITIALIZED;
 	}
 
-	if (!selinux_state.initialized || !(sbsec->flags & SBLABEL_MNT))
+	if (!ss_initialized || !(sbsec->flags & SBLABEL_MNT)) // SEC_SELINUX_PORTING_COMMON Change to use RKP
 		return -EOPNOTSUPP;
 
 	if (name)
@@ -3180,8 +3314,7 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
 
 static noinline int audit_inode_permission(struct inode *inode,
 					   u32 perms, u32 audited, u32 denied,
-					   int result,
-					   unsigned flags)
+					   int result)
 {
 	struct common_audit_data ad;
 	struct inode_security_struct *isec = inode->i_security;
@@ -3192,7 +3325,7 @@ static noinline int audit_inode_permission(struct inode *inode,
 
 	rc = slow_avc_audit(&selinux_state,
 			    current_sid(), isec->sid, isec->sclass, perms,
-			    audited, denied, result, &ad, flags);
+			    audited, denied, result, &ad);
 	if (rc)
 		return rc;
 	return 0;
@@ -3229,6 +3362,24 @@ static int selinux_inode_permission(struct inode *inode, int mask)
 	if (IS_ERR(isec))
 		return PTR_ERR(isec);
 
+// [ SEC_SELINUX_PORTING_COMMON
+	/* skip sid == 1(kernel), it means first boot time */
+	if (isec->initialized != 1 && sid != 1) {
+		int count = 5;
+
+		while (count-- > 0) {
+			pr_err("SELinux : inode->i_security is not initialized. waiting...(%d/5)\n", 5-count);
+			udelay(500);
+			if (isec->initialized == 1) {
+				pr_err("SELinux : inode->i_security is INITIALIZED.\n");
+				break;
+			}
+		}
+		if (isec->initialized != 1)
+			pr_err("SELinux : inode->i_security is not initialized. not fixed.\n");
+	}
+// ] SEC_SELINUX_PORTING_COMMON
+
 	rc = avc_has_perm_noaudit(&selinux_state,
 				  sid, isec->sid, isec->sclass, perms,
 				  (flags & MAY_NOT_BLOCK) ? AVC_NONBLOCKING : 0,
@@ -3239,7 +3390,11 @@ static int selinux_inode_permission(struct inode *inode, int mask)
 	if (likely(!audited))
 		return rc;
 
-	rc2 = audit_inode_permission(inode, perms, audited, denied, rc, flags);
+	/* fall back to ref-walk if we have to generate audit */
+	if (flags & MAY_NOT_BLOCK)
+		return -ECHILD;
+
+	rc2 = audit_inode_permission(inode, perms, audited, denied, rc);
 	if (rc2)
 		return rc2;
 	return rc;
@@ -3281,11 +3436,11 @@ static int selinux_inode_getattr(const struct path *path)
 static bool has_cap_mac_admin(bool audit)
 {
 	const struct cred *cred = current_cred();
-	int cap_audit = audit ? SECURITY_CAP_AUDIT : SECURITY_CAP_NOAUDIT;
+	unsigned int opts = audit ? CAP_OPT_NONE : CAP_OPT_NOAUDIT;
 
-	if (cap_capable(cred, &init_user_ns, CAP_MAC_ADMIN, cap_audit))
+	if (cap_capable(cred, &init_user_ns, CAP_MAC_ADMIN, opts))
 		return false;
-	if (cred_has_capability(cred, CAP_MAC_ADMIN, cap_audit, true))
+	if (cred_has_capability(cred, CAP_MAC_ADMIN, opts, true))
 		return false;
 	return true;
 }
@@ -3689,7 +3844,7 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 	case KDSKBENT:
 	case KDSKBSENT:
 		error = cred_has_capability(cred, CAP_SYS_TTY_CONFIG,
-					    SECURITY_CAP_AUDIT, true);
+					    CAP_OPT_NONE, true);
 		break;
 
 	/* default case assumes that the command will go
@@ -3970,8 +4125,17 @@ static void selinux_cred_free(struct cred *cred)
 	 * security_prepare_creds() returned an error.
 	 */
 	BUG_ON(cred->security && (unsigned long) cred->security < PAGE_SIZE);
+#ifdef CONFIG_KDP_CRED
+	if (rkp_ro_page((unsigned long)cred)) {
+		uh_call(UH_APP_RKP, RKP_KDP_X45,(u64) &cred->security, 7,0,0);
+	} else
+#endif
 	cred->security = (void *) 0x7UL;
+#ifdef CONFIG_KDP_CRED
+	rkp_free_security((unsigned long)tsec);
+#else
 	kfree(tsec);
+#endif
 }
 
 /*
@@ -5206,15 +5370,17 @@ out:
 
 static int selinux_sk_alloc_security(struct sock *sk, int family, gfp_t priority)
 {
-	struct sk_security_struct *sksec = sk->sk_security;
+	struct sk_security_struct *sksec;
 
-#ifdef CONFIG_NETLABEL
-	memset(sksec, 0, offsetof(struct sk_security_struct, sid));
-#endif
+	sksec = kzalloc(sizeof(*sksec), priority);
+	if (!sksec)
+		return -ENOMEM;
+
 	sksec->peer_sid = SECINITSID_UNLABELED;
 	sksec->sid = SECINITSID_UNLABELED;
 	sksec->sclass = SECCLASS_SOCKET;
 	selinux_netlbl_sk_security_reset(sksec);
+	sk->sk_security = sksec;
 
 	return 0;
 }
@@ -5223,12 +5389,14 @@ static void selinux_sk_free_security(struct sock *sk)
 {
 	struct sk_security_struct *sksec = sk->sk_security;
 
+	sk->sk_security = NULL;
 	selinux_netlbl_sk_security_free(sksec);
+	kfree(sksec);
 }
 
 static void selinux_sk_clone_security(const struct sock *sk, struct sock *newsk)
 {
-	const struct sk_security_struct *sksec = sk->sk_security;
+	struct sk_security_struct *sksec = sk->sk_security;
 	struct sk_security_struct *newsksec = newsk->sk_security;
 
 	newsksec->sid = sksec->sid;
@@ -5625,7 +5793,7 @@ static int selinux_nlmsg_perm(struct sock *sk, struct sk_buff *skb)
 				return rc;
 		} else if (rc == -EINVAL) {
 			/* -EINVAL is a missing msg/perm mapping */
- 			pr_warn_ratelimited("SELinux: unrecognized netlink"
+			pr_warn_ratelimited("SELinux: unrecognized netlink"
 				" message: protocol=%hu nlmsg_type=%hu sclass=%s"
 				" pid=%d comm=%s\n",
 				sk->sk_protocol, nlh->nlmsg_type,
@@ -5640,16 +5808,16 @@ static int selinux_nlmsg_perm(struct sock *sk, struct sk_buff *skb)
 			rc = 0;
 		} else {
 			return rc;
- 		}
- 
+		}
+
 		/* move to the next message after applying netlink padding */
 		msg_len = NLMSG_ALIGN(nlh->nlmsg_len);
 		if (msg_len >= data_len)
 			return 0;
 		data_len -= msg_len;
 		data += msg_len;
- 	}
- 
+	}
+
 	return rc;
 }
 
@@ -7027,7 +7195,11 @@ static int selinux_perf_event_write(struct perf_event *event)
 }
 #endif
 
+#ifdef CONFIG_KDP_CRED
+static struct security_hook_list selinux_hooks[] __lsm_ro_after_init_kdp = {
+#else
 static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+#endif
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
 	LSM_HOOK_INIT(binder_transfer_binder, selinux_binder_transfer_binder),
@@ -7275,7 +7447,13 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 static __init int selinux_init(void)
 {
 	if (!security_module_enable("selinux")) {
+// [ SEC_SELINUX_PORTING_COMMON
+#ifdef CONFIG_ALWAYS_ENFORCE
+		selinux_enabled = 1;
+#else
 		selinux_enabled = 0;
+#endif
+// ] SEC_SELINUX_PORTING_COMMON
 		return 0;
 	}
 
@@ -7318,6 +7496,12 @@ static __init int selinux_init(void)
 
 	if (avc_add_callback(selinux_lsm_notifier_avc_callback, AVC_CALLBACK_RESET))
 		panic("SELinux: Unable to register AVC LSM notifier callback\n");
+
+// [ SEC_SELINUX_PORTING_COMMON
+#ifdef CONFIG_ALWAYS_ENFORCE
+		selinux_enforcing_boot = 1;
+#endif
+// ] SEC_SELINUX_PORTING_COMMON
 
 	if (selinux_enforcing_boot)
 		pr_debug("SELinux:  Starting in enforcing mode\n");
@@ -7408,6 +7592,11 @@ static struct pernet_operations selinux_net_ops = {
 static int __init selinux_nf_ip_init(void)
 {
 	int err;
+// [ SEC_SELINUX_PORTING_COMMON
+#ifdef CONFIG_ALWAYS_ENFORCE
+		selinux_enabled = 1;
+#endif
+// ] SEC_SELINUX_PORTING_COMMON
 	if (!selinux_enabled)
 		return 0;
 
@@ -7439,19 +7628,20 @@ static void selinux_nf_ip_exit(void)
 #endif /* CONFIG_NETFILTER */
 
 #ifdef CONFIG_SECURITY_SELINUX_DISABLE
+static int selinux_disabled;
 int selinux_disable(struct selinux_state *state)
 {
-	if (state->initialized) {
+	if (ss_initialized) {// SEC_SELINUX_PORTING_COMMON Change to use RKP
 		/* Not permitted after initial policy load. */
 		return -EINVAL;
 	}
 
-	iif (state->disabled) {
+	if (selinux_disabled) {
 		/* Only do this once. */
 		return -EINVAL;
 	}
 
-	state->disabled = 1;
+	selinux_disabled = 1;
 
 	pr_info("SELinux:  Disabled at runtime.\n");
 
@@ -7471,3 +7661,4 @@ int selinux_disable(struct selinux_state *state)
 	return 0;
 }
 #endif
+

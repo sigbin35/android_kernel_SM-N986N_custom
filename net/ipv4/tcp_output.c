@@ -73,6 +73,9 @@ void tcp_event_new_data_sent(struct sock *sk, struct sk_buff *skb)
 	__skb_unlink(skb, &sk->sk_write_queue);
 	tcp_rbtree_insert(&sk->tcp_rtx_queue, skb);
 
+	if (tp->highest_sack == NULL)
+		tp->highest_sack = skb;
+
 	tp->packets_out += tcp_skb_pcount(skb);
 	if (!prior_packets || icsk->icsk_pending == ICSK_TIME_LOSS_PROBE)
 		tcp_rearm_rto(sk);
@@ -242,16 +245,6 @@ void tcp_select_initial_window(const struct sock *sk, int __space, __u32 mss,
 			(*rcv_wscale)++;
 		}
 	}
-
-#ifdef CONFIG_LARGE_TCP_INITIAL_BUFFER
-	pr_info("TCP: default window size: %u\n", *rcv_wnd);
-	/* Lock the initial TCP window size to 64K.
-	 * Assuming 1500 packet size, 64240 is the largest multiple
-	 * of MSS (44 * 1460) under 65535 (2 << 15).
-	 */
-	*rcv_wnd = 64240;
-#endif
-
 	/* Set the clamp no higher than max representable value */
 	(*window_clamp) = min_t(__u32, U16_MAX << (*rcv_wscale), *window_clamp);
 }
@@ -295,6 +288,7 @@ u16 tcp_select_window(struct sock *sk)
 				      LINUX_MIB_TCPWANTZEROWINDOWADV);
 		new_win = ALIGN(cur_win, 1 << tp->rx_opt.rcv_wscale);
 	}
+
 	tp->rcv_wnd = new_win;
 	tp->rcv_wup = tp->rcv_nxt;
 
@@ -810,9 +804,7 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
 			min_t(unsigned int, eff_sacks,
 			      (remaining - TCPOLEN_SACK_BASE_ALIGNED) /
 			      TCPOLEN_SACK_PERBLOCK);
-#ifdef CONFIG_MPTCP
-		if (opts->num_sack_blocks)
-#endif
+		if (likely(opts->num_sack_blocks))
 			size += TCPOLEN_SACK_BASE_ALIGNED +
 				opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
 	}
@@ -926,7 +918,7 @@ static void tcp_tasklet_func(unsigned long data)
 }
 
 #ifdef CONFIG_MPTCP
-	#define TCP_DEFERRED_ALL (TCPF_TSQ_DEFERRED |		\
+#define TCP_DEFERRED_ALL (TCPF_TSQ_DEFERRED |		\
 			  TCPF_WRITE_TIMER_DEFERRED |	\
 			  TCPF_DELACK_TIMER_DEFERRED |	\
 			  TCPF_MTU_REDUCED_DEFERRED | \
@@ -1934,7 +1926,7 @@ unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 #ifdef CONFIG_MPTCP
 		skb &&
 #endif
-	(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) &&
+		(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) &&
 	    tcp_skb_pcount(skb) == 1)
 		return 1;
 
@@ -2217,6 +2209,9 @@ static bool tcp_can_coalesce_send_queue_head(struct sock *sk, int len)
 	struct sk_buff *skb, *next;
 
 	skb = tcp_send_head(sk);
+	if (!skb)
+		return false;
+
 	tcp_for_write_queue_from_safe(skb, next, sk) {
 		if (len <= skb->len)
 			break;
@@ -2499,7 +2494,8 @@ bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	sent_pkts = 0;
 
 	tcp_mstamp_refresh(tp);
-/* pmtu not yet supported with MPTCP. Should be possible, by early
+
+	/* pmtu not yet supported with MPTCP. Should be possible, by early
 	 * exiting the loop inside tcp_mtu_probe, making sure that only one
 	 * single DSS-mapping gets probed.
 	 */
@@ -2573,6 +2569,14 @@ bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			break;
 
 		if (tcp_small_queue_check(sk, skb, 0))
+			break;
+
+		/* Argh, we hit an empty skb(), presumably a thread
+		 * is sleeping in sendmsg()/sk_stream_wait_memory().
+		 * We do not want to send a pure-ack packet and have
+		 * a strange looking rtx queue with empty packet(s).
+		 */
+		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
 			break;
 
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
@@ -2693,7 +2697,7 @@ void tcp_send_loss_probe(struct sock *sk)
 	if (skb && tcp_snd_wnd_test(tp, skb, mss)) {
 		pcount = tp->packets_out;
 #ifdef CONFIG_MPTCP
-			tp->ops->write_xmit(sk, mss, TCP_NAGLE_OFF, 2, GFP_ATOMIC);
+		tp->ops->write_xmit(sk, mss, TCP_NAGLE_OFF, 2, GFP_ATOMIC);
 #else
 		tcp_write_xmit(sk, mss, TCP_NAGLE_OFF, 2, GFP_ATOMIC);
 #endif
@@ -3146,7 +3150,7 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
 		TCP_SKB_CB(skb)->sacked |= TCPCB_EVER_RETRANS;
 		trace_tcp_retransmit_skb(sk, skb);
 	} else if (err != -EBUSY) {
-		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPRETRANSFAIL);
+		NET_ADD_STATS(sock_net(sk), LINUX_MIB_TCPRETRANSFAIL, segs);
 	}
 	return err;
 }
@@ -3380,6 +3384,7 @@ int tcp_send_synack(struct sock *sk)
 			if (!nskb)
 				return -ENOMEM;
 			INIT_LIST_HEAD(&nskb->tcp_tsorted_anchor);
+			tcp_highest_sack_replace(sk, skb, nskb);
 			tcp_rtx_queue_unlink_and_free(skb, sk);
 			__skb_header_release(nskb);
 			tcp_rbtree_insert(&sk->tcp_rtx_queue, nskb);

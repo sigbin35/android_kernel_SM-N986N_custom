@@ -176,7 +176,7 @@ static ssize_t runtime_status_show(struct device *dev,
 			return -EIO;
 		}
 	}
-	return sprintf(buf, "%s", p);
+	return sprintf(buf, p);
 }
 
 static DEVICE_ATTR_RO(runtime_status);

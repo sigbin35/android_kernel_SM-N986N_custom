@@ -168,4 +168,3 @@ int __init sec_log_init(void)
 	return 0;
 }
 fs_initcall(sec_log_init);
-

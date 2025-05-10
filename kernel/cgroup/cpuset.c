@@ -433,14 +433,19 @@ static struct cpuset *alloc_trial_cpuset(struct cpuset *cs)
 
 	if (!alloc_cpumask_var(&trial->cpus_allowed, GFP_KERNEL))
 		goto free_cs;
+	if (!alloc_cpumask_var(&trial->cpus_requested, GFP_KERNEL))
+		goto free_allowed;
 	if (!alloc_cpumask_var(&trial->effective_cpus, GFP_KERNEL))
 		goto free_cpus;
 
 	cpumask_copy(trial->cpus_allowed, cs->cpus_allowed);
+	cpumask_copy(trial->cpus_requested, cs->cpus_requested);
 	cpumask_copy(trial->effective_cpus, cs->effective_cpus);
 	return trial;
 
 free_cpus:
+	free_cpumask_var(trial->cpus_requested);
+free_allowed:
 	free_cpumask_var(trial->cpus_allowed);
 free_cs:
 	kfree(trial);
@@ -454,6 +459,7 @@ free_cs:
 static void free_trial_cpuset(struct cpuset *trial)
 {
 	free_cpumask_var(trial->effective_cpus);
+	free_cpumask_var(trial->cpus_requested);
 	free_cpumask_var(trial->cpus_allowed);
 	kfree(trial);
 }
@@ -707,8 +713,7 @@ static int generate_sched_domains(cpumask_var_t **domains,
 					 housekeeping_cpumask(HK_FLAG_DOMAIN))))
 			continue;
 
-		if (is_sched_load_balance(cp) &&
-		    !cpumask_empty(cp->effective_cpus))
+		if (is_sched_load_balance(cp))
 			csa[csn++] = cp;
 
 		/* skip @cp's subtree */
@@ -864,6 +869,20 @@ void rebuild_sched_domains(void)
 	put_online_cpus();
 }
 
+static int update_cpus_allowed(struct cpuset *cs, struct task_struct *p,
+			       const struct cpumask *new_mask)
+{
+	int ret;
+
+	if (cpumask_subset(&p->cpus_requested, cs->cpus_requested)) {
+		ret = set_cpus_allowed_ptr(p, &p->cpus_requested);
+		if (!ret)
+			return ret;
+	}
+
+	return set_cpus_allowed_ptr(p, new_mask);
+}
+
 /**
  * update_tasks_cpumask - Update the cpumasks of tasks in the cpuset.
  * @cs: the cpuset in which each task's cpus_allowed mask needs to be changed
@@ -879,7 +898,7 @@ static void update_tasks_cpumask(struct cpuset *cs)
 
 	css_task_iter_start(&cs->css, 0, &it);
 	while ((task = css_task_iter_next(&it)))
-		set_cpus_allowed_ptr(task, cs->effective_cpus);
+		update_cpus_allowed(cs, task, cs->effective_cpus);
 	css_task_iter_end(&it);
 }
 
@@ -966,23 +985,23 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 		return -EACCES;
 
 	/*
-	 * An empty cpus_allowed is ok only if the cpuset has no tasks.
+	 * An empty cpus_requested is ok only if the cpuset has no tasks.
 	 * Since cpulist_parse() fails on an empty mask, we special case
 	 * that parsing.  The validate_change() call ensures that cpusets
 	 * with tasks have cpus.
 	 */
 	if (!*buf) {
-		cpumask_clear(trialcs->cpus_allowed);
+		cpumask_clear(trialcs->cpus_requested);
 	} else {
 		retval = cpulist_parse(buf, trialcs->cpus_requested);
 		if (retval < 0)
 			return retval;
-
-		if (!cpumask_subset(trialcs->cpus_requested, cpu_present_mask))
-			return -EINVAL;
-
-		cpumask_and(trialcs->cpus_allowed, trialcs->cpus_requested, cpu_active_mask);
 	}
+
+	if (!cpumask_subset(trialcs->cpus_requested, cpu_present_mask))
+		return -EINVAL;
+
+	cpumask_and(trialcs->cpus_allowed, trialcs->cpus_requested, cpu_active_mask);
 
 	/* Nothing to do if the cpus didn't change */
 	if (cpumask_equal(cs->cpus_requested, trialcs->cpus_requested))
@@ -1273,7 +1292,7 @@ bool current_cpuset_is_being_rebound(void)
 static int update_relax_domain_level(struct cpuset *cs, s64 val)
 {
 #ifdef CONFIG_SMP
-	if (val < -1 || val > sched_domain_level_max + 1)
+	if (val < -1 || val >= sched_domain_level_max)
 		return -EINVAL;
 #endif
 
@@ -1508,9 +1527,7 @@ static void cpuset_cancel_attach(struct cgroup_taskset *tset)
 	cs = css_cs(css);
 
 	mutex_lock(&cpuset_mutex);
-	cs->attach_in_progress--;
-	if (!cs->attach_in_progress)
-		wake_up(&cpuset_attach_wq);
+	css_cs(css)->attach_in_progress--;
 	mutex_unlock(&cpuset_mutex);
 }
 
@@ -1534,7 +1551,6 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	cgroup_taskset_first(tset, &css);
 	cs = css_cs(css);
 
-	lockdep_assert_cpus_held();     /* see cgroup_attach_lock() */
 	mutex_lock(&cpuset_mutex);
 
 	/* prepare for attach */
@@ -1550,7 +1566,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 		 * can_attach beforehand should guarantee that this doesn't
 		 * fail.  TODO: have a better way to handle failure here
 		 */
-		WARN_ON_ONCE(set_cpus_allowed_ptr(task, cpus_attach));
+		WARN_ON_ONCE(update_cpus_allowed(cs, task, cpus_attach));
 
 		cpuset_change_task_nodemask(task, &cpuset_attach_nodemask_to);
 		cpuset_update_task_spread_flag(cs, task);
@@ -2423,14 +2439,10 @@ static struct notifier_block cpuset_track_online_nodes_nb = {
  */
 void __init cpuset_init_smp(void)
 {
-	/*
-	 * cpus_allowd/mems_allowed set to v2 values in the initial
-	 * cpuset_bind() call will be reset to v1 values in another
-	 * cpuset_bind() call when v1 cpuset is mounted.
-	 */
+	cpumask_copy(top_cpuset.cpus_allowed, cpu_active_mask);
+	top_cpuset.mems_allowed = node_states[N_MEMORY];
 	top_cpuset.old_mems_allowed = top_cpuset.mems_allowed;
 
-	cpumask_copy(top_cpuset.cpus_requested, cpu_possible_mask);
 	cpumask_copy(top_cpuset.effective_cpus, cpu_active_mask);
 	top_cpuset.effective_mems = node_states[N_MEMORY];
 

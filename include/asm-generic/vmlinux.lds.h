@@ -57,10 +57,6 @@
 /* Align . to a 8 byte boundary equals to maximum function alignment. */
 #define ALIGN_FUNCTION()  . = ALIGN(8)
 
-#ifndef CONFIG_UML
-#include <asm/kernel-pgtable.h>
-#endif
-
 /*
  * LD_DEAD_CODE_DATA_ELIMINATION option enables -fdata-sections, which
  * generates .data.identifier sections, which need to be pulled in with
@@ -73,10 +69,10 @@
 #if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
 #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
 #define TEXT_CFI_MAIN .text.[0-9a-zA-Z_]*.cfi
-#define DATA_MAIN .data .data.[0-9a-zA-Z_]* .data..L* .data..compoundliteral*
+#define DATA_MAIN .data .data.[0-9a-zA-Z_]* .data..LPBX*
 #define SDATA_MAIN .sdata .sdata.[0-9a-zA-Z_]*
-#define RODATA_MAIN .rodata .rodata.[0-9a-zA-Z_]* .rodata..L*
-#define BSS_MAIN .bss .bss.[0-9a-zA-Z_]* .bss..compoundliteral*
+#define RODATA_MAIN .rodata .rodata.[0-9a-zA-Z_]*
+#define BSS_MAIN .bss .bss.[0-9a-zA-Z_]*
 #define SBSS_MAIN .sbss .sbss.[0-9a-zA-Z_]*
 #else
 #define TEXT_MAIN .text
@@ -248,7 +244,6 @@
 #define DATA_DATA							\
 	*(.xiptext)							\
 	*(DATA_MAIN)							\
-	*(.data..decrypted)						\
 	*(.ref.data)							\
 	*(.data..shared_aligned) /* percpu related */			\
 	MEM_KEEP(init.data*)						\
@@ -313,25 +308,26 @@
  */
 #ifndef RO_AFTER_INIT_DATA
 #define RO_AFTER_INIT_DATA						\
-	. = ALIGN(8);							\
 	__start_ro_after_init = .;					\
 	*(.data..ro_after_init)						\
 	__end_ro_after_init = .;
 #endif
 
+#ifdef CONFIG_UH_RKP
 #define PG_IDMAP							\
-	. = ALIGN(PAGE_SIZE);					\
-		idmap_pg_dir = .;					\
+	. = ALIGN(PAGE_SIZE);						\
+	idmap_pg_dir = .;						\
 	. += IDMAP_DIR_SIZE;
 
 #define PG_SWAP								\
-	. = ALIGN(PAGE_SIZE);					\
-		swapper_pg_dir = .;					\
-	. += SWAPPER_DIR_SIZE;                  \
-        swapper_pg_end = .;                 
+	. = ALIGN(PAGE_SIZE);						\
+	swapper_pg_dir = .;						\
+	. += SWAPPER_DIR_SIZE;						\
+	swapper_pg_end = .;						
+
 #ifdef CONFIG_ARM64_SW_TTBR0_PAN
 #define PG_RESERVED							\
-	. = ALIGN(PAGE_SIZE);					\
+	. = ALIGN(PAGE_SIZE);						\
 	reserved_ttbr0 = .;						\
 	. += RESERVED_TTBR0_SIZE;
 #else
@@ -340,12 +336,36 @@
 
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
 #define PG_TRAMP							\
-	. = ALIGN(PAGE_SIZE);					\
+	. = ALIGN(PAGE_SIZE);						\
 	tramp_pg_dir = .;						\
 	. += PAGE_SIZE;
 #else
 #define PG_TRAMP
 #endif
+
+#define RKP_RO_DATA							\
+	PG_IDMAP							\
+	PG_SWAP								\
+	PG_RESERVED							\
+	PG_TRAMP
+
+#define RKP_RO_SECTION							\
+	. = ALIGN(4096);						\
+	.rkp_bss          : AT(ADDR(.rkp_bss) - LOAD_OFFSET) {		\
+		*(.rkp_bss.page_aligned)				\
+		*(.rkp_bss)						\
+	} = 0								\
+				 					\
+	.rkp_ro          : AT(ADDR(.rkp_ro) - LOAD_OFFSET) {		\
+		*(.rkp_ro)						\
+		*(.kdp_ro)						\
+		RKP_RO_DATA	/* Read only after init */		\
+	}								\
+
+#else
+#define RKP_RO_SECTION
+#endif
+
 
 /*
  * Read only Data
@@ -355,6 +375,7 @@
 	.rodata           : AT(ADDR(.rodata) - LOAD_OFFSET) {		\
 		__start_rodata = .;					\
 		*(.rodata) *(.rodata.*)					\
+		RO_AFTER_INIT_DATA	/* Read only after init */	\
 		KEEP(*(__vermagic))	/* Kernel version magic */	\
 		. = ALIGN(8);						\
 		__start___tracepoints_ptrs = .;				\
@@ -364,10 +385,11 @@
 	}								\
 									\
 	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
-		RO_AFTER_INIT_DATA	/* Read only after init */	\
 		*(.rodata1)						\
-	}                                                               \
+	}								\
 									\
+	/*CONFIG_RKP_UH*/						\
+	RKP_RO_SECTION							\
 	/* PCI quirks */						\
 	.pci_fixup        : AT(ADDR(.pci_fixup) - LOAD_OFFSET) {	\
 		__start_pci_fixups_early = .;				\
@@ -397,7 +419,7 @@
 	}								\
 									\
 	/* Built-in firmware blobs */					\
-	.builtin_fw : AT(ADDR(.builtin_fw) - LOAD_OFFSET) ALIGN(8) {	\
+	.builtin_fw        : AT(ADDR(.builtin_fw) - LOAD_OFFSET) {	\
 		__start_builtin_fw = .;					\
 		KEEP(*(.builtin_fw))					\
 		__end_builtin_fw = .;					\
@@ -480,8 +502,6 @@
 		*(__ksymtab_strings)					\
 	}								\
 									\
-	SECDBG_MEMBERS							\
-									\
 	/* __*init sections */						\
 	__init_rodata : AT(ADDR(__init_rodata) - LOAD_OFFSET) {		\
 		*(.ref.rodata)						\
@@ -519,15 +539,6 @@
 	}
 
 /*
- * Non-instrumentable text section
- */
-#define NOINSTR_TEXT							\
-		ALIGN_FUNCTION();					\
-		__noinstr_text_start = .;				\
-		*(.noinstr.text)					\
-		__noinstr_text_end = .;
-
-/*
  * .text section. Map to function alignment to avoid address changes
  * during second ld run in second ld pass when generating System.map
  *
@@ -539,11 +550,9 @@
 		ALIGN_FUNCTION();					\
 		*(.text.hot TEXT_MAIN .text.fixup .text.unlikely)	\
 		*(TEXT_CFI_MAIN) 					\
-		NOINSTR_TEXT						\
 		*(.text..refcount)					\
 		*(.text..ftrace)					\
 		*(.ref.text)						\
-		*(.text.asan.* .text.tsan.*)				\
 	MEM_KEEP(init.text*)						\
 	MEM_KEEP(exit.text*)						\
 
@@ -745,13 +754,8 @@
 		/* DWARF 4 */						\
 		.debug_types	0 : { *(.debug_types) }			\
 		/* DWARF 5 */						\
-		.debug_addr	0 : { *(.debug_addr) }			\
-		.debug_line_str	0 : { *(.debug_line_str) }		\
-		.debug_loclists	0 : { *(.debug_loclists) }		\
 		.debug_macro	0 : { *(.debug_macro) }			\
-		.debug_names	0 : { *(.debug_names) }			\
-		.debug_rnglists	0 : { *(.debug_rnglists) }		\
-		.debug_str_offsets	0 : { *(.debug_str_offsets) }
+		.debug_addr	0 : { *(.debug_addr) }
 
 		/* Stabs debugging sections.  */
 #define STABS_DEBUG							\
@@ -800,19 +804,6 @@
 #define ORC_UNWIND_TABLE
 #endif
 
-#ifdef CONFIG_SEC_DEBUG
-#define SECDBG_MEMBERS							\
-	/* Secdbg member table: offsets */				\
-	. = ALIGN(8);							\
-	__secdbg_member_table : AT(ADDR(__secdbg_member_table) - LOAD_OFFSET) { \
-		__start__secdbg_member_table = .;			\
-		KEEP(*(SORT(.secdbg_mbtab.*))) 				\
-		__stop__secdbg_member_table = .;			\
-	}
-#else
-#define SECDBG_MEMBERS
-#endif
-
 #ifdef CONFIG_PM_TRACE
 #define TRACEDATA							\
 	. = ALIGN(4);							\
@@ -843,6 +834,30 @@
 		KEEP(*(.initcall##level##.init))			\
 		KEEP(*(.initcall##level##s.init))			\
 
+#ifdef CONFIG_DEFERRED_INITCALLS
+#define DEFERRED_INITCALLS(level)					\
+		__deferred_initcall_start = .;		\
+		KEEP(*(.deferred_initcall##level##.init))		\
+		KEEP(*(.deferred_initcall##level##s.init))		\
+		__deferred_initcall_end = .;
+#endif
+
+#ifdef CONFIG_DEFERRED_INITCALLS
+#define INIT_CALLS							\
+		__initcall_start = .;					\
+		KEEP(*(.initcallearly.init))				\
+		INIT_CALLS_LEVEL(0)					\
+		INIT_CALLS_LEVEL(1)					\
+		INIT_CALLS_LEVEL(2)					\
+		INIT_CALLS_LEVEL(3)					\
+		INIT_CALLS_LEVEL(4)					\
+		INIT_CALLS_LEVEL(5)					\
+		INIT_CALLS_LEVEL(rootfs)				\
+		INIT_CALLS_LEVEL(6)					\
+		INIT_CALLS_LEVEL(7)					\
+		__initcall_end = .;					\
+		DEFERRED_INITCALLS(0)
+#else
 #define INIT_CALLS							\
 		__initcall_start = .;					\
 		KEEP(*(.initcallearly.init))				\
@@ -856,6 +871,7 @@
 		INIT_CALLS_LEVEL(6)					\
 		INIT_CALLS_LEVEL(7)					\
 		__initcall_end = .;
+#endif
 
 #define CON_INITCALL							\
 		__con_initcall_start = .;				\

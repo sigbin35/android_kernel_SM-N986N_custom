@@ -240,10 +240,13 @@ static int call_device_notify(struct usb_device *dev, int connect)
 			store_usblog_notify(NOTIFY_PORT_CONNECT,
 				(void *)&dev->descriptor.idVendor,
 				(void *)&dev->descriptor.idProduct);
-		} else
+		} else {
+			send_otg_notify(o_notify,
+				NOTIFY_EVENT_DEVICE_CONNECT, 0);
 			store_usblog_notify(NOTIFY_PORT_DISCONNECT,
 				(void *)&dev->descriptor.idVendor,
 				(void *)&dev->descriptor.idProduct);
+		}
 	} else {
 		if (connect)
 			pr_info("%s root hub\n", __func__);
@@ -283,8 +286,8 @@ static void check_device_speed(struct usb_device *dev, bool on)
 	struct usb_device *udev;
 	int port = 0;
 	int speed = USB_SPEED_UNKNOWN;
-	static int hs_hub;
-	static int ss_hub;
+	static int hs_hub = 0;
+	static int ss_hub = 0;
 
 	if (!o_notify) {
 		pr_err("%s otg_notify is null\n", __func__);
@@ -441,6 +444,8 @@ static int dev_notify(struct notifier_block *self,
 		set_hw_param(dev);
 #endif
 		check_unsupport_device(dev);
+		check_usbaudio(dev);
+		check_usbgroup(dev);
 		break;
 	case USB_DEVICE_REMOVE:
 		call_device_notify(dev, 0);

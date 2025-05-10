@@ -58,7 +58,8 @@ obj-$(CONFIG_SERIAL_SGI_IOC3) += ioc3_serial.o
 obj-$(CONFIG_SERIAL_ATMEL) += atmel_serial.o
 obj-$(CONFIG_SERIAL_UARTLITE) += uartlite.o
 obj-$(CONFIG_SERIAL_MSM) += msm_serial.o
-obj-$(CONFIG_SERIAL_QCOM_GENI) += qcom_geni_serial.o
+obj-$(CONFIG_SERIAL_MSM_GENI) += msm_geni_serial.o
+obj-$(CONFIG_SERIAL_MSM_HS) += msm_serial_hs.o
 obj-$(CONFIG_SERIAL_NETX) += netx-serial.o
 obj-$(CONFIG_SERIAL_KS8695) += serial_ks8695.o
 obj-$(CONFIG_SERIAL_OMAP) += omap-serial.o
@@ -95,6 +96,3 @@ obj-$(CONFIG_SERIAL_MCTRL_GPIO)	+= serial_mctrl_gpio.o
 
 obj-$(CONFIG_SERIAL_KGDB_NMI) += kgdb_nmi.o
 obj-$(CONFIG_KGDB_SERIAL_CONSOLE) += kgdboc.o
-
-# Disable LTO for Samsung Serial
-CFLAGS_samsung.o += $(DISABLE_LTO)

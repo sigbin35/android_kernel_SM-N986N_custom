@@ -2,6 +2,7 @@
 #ifndef _LINUX_KERNEL_H
 #define _LINUX_KERNEL_H
 
+
 #include <stdarg.h>
 #include <linux/linkage.h>
 #include <linux/stddef.h>
@@ -14,7 +15,34 @@
 #include <linux/build_bug.h>
 #include <asm/byteorder.h>
 #include <uapi/linux/kernel.h>
-#include <linux/limits.h>
+
+#define USHRT_MAX	((u16)(~0U))
+#define SHRT_MAX	((s16)(USHRT_MAX>>1))
+#define SHRT_MIN	((s16)(-SHRT_MAX - 1))
+#define INT_MAX		((int)(~0U>>1))
+#define INT_MIN		(-INT_MAX - 1)
+#define UINT_MAX	(~0U)
+#define LONG_MAX	((long)(~0UL>>1))
+#define LONG_MIN	(-LONG_MAX - 1)
+#define ULONG_MAX	(~0UL)
+#define LLONG_MAX	((long long)(~0ULL>>1))
+#define LLONG_MIN	(-LLONG_MAX - 1)
+#define ULLONG_MAX	(~0ULL)
+#define SIZE_MAX	(~(size_t)0)
+#define PHYS_ADDR_MAX	(~(phys_addr_t)0)
+
+#define U8_MAX		((u8)~0U)
+#define S8_MAX		((s8)(U8_MAX>>1))
+#define S8_MIN		((s8)(-S8_MAX - 1))
+#define U16_MAX		((u16)~0U)
+#define S16_MAX		((s16)(U16_MAX>>1))
+#define S16_MIN		((s16)(-S16_MAX - 1))
+#define U32_MAX		((u32)~0U)
+#define S32_MAX		((s32)(U32_MAX>>1))
+#define S32_MIN		((s32)(-S32_MAX - 1))
+#define U64_MAX		((u64)~0ULL)
+#define S64_MAX		((s64)(U64_MAX>>1))
+#define S64_MIN		((s64)(-S64_MAX - 1))
 
 #define STACK_MAGIC	0xdeadbeef
 
@@ -296,7 +324,6 @@ static inline void might_fault(void) { }
 
 extern struct atomic_notifier_head panic_notifier_list;
 extern long (*panic_blink)(int state);
-extern bool in_panic;
 __printf(1, 2)
 void panic(const char *fmt, ...) __noreturn __cold;
 void nmi_panic(struct pt_regs *regs, const char *msg);
@@ -551,7 +578,6 @@ extern enum system_states {
 	SYSTEM_POWER_OFF,
 	SYSTEM_RESTART,
 	SYSTEM_SUSPEND,
-	SYSTEM_END,
 } system_state;
 
 /* This cannot be an enum because some may be used in assembly source. */
@@ -571,7 +597,7 @@ extern enum system_states {
 #define TAINT_UNSIGNED_MODULE		13
 #define TAINT_SOFTLOCKUP		14
 #define TAINT_LIVEPATCH			15
-#define TAINT_AUX				16
+#define TAINT_AUX			16
 #define TAINT_RANDSTRUCT		17
 #define TAINT_FLAGS_COUNT		18
 
@@ -703,9 +729,6 @@ do {									\
  * let gcc optimize the rest.
  */
 
-#ifdef CONFIG_DISABLE_TRACE_PRINTK
-#define trace_printk pr_debug
-#else
 #define trace_printk(fmt, ...)				\
 do {							\
 	char _______STR[] = __stringify((__VA_ARGS__));	\
@@ -728,7 +751,6 @@ do {									\
 	else								\
 		__trace_printk(_THIS_IP_, fmt, ##args);			\
 } while (0)
-#endif
 
 extern __printf(2, 3)
 int __trace_bprintk(unsigned long ip, const char *fmt, ...);

@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/idle.h>
 #include <linux/notifier.h>
 #include <linux/pm_qos.h>
 #include <linux/cpu.h>
@@ -22,9 +23,7 @@
 #include <linux/module.h>
 #include <linux/suspend.h>
 #include <linux/tick.h>
-#include <linux/exynos-ucc.h>
 #include <trace/events/power.h>
-#include <linux/sec_perf.h>
 
 #include "cpuidle.h"
 
@@ -51,49 +50,6 @@ bool cpuidle_not_available(struct cpuidle_driver *drv,
 			   struct cpuidle_device *dev)
 {
 	return off || !initialized || !drv || !dev || !dev->enabled;
-}
-
-unsigned int cpuidle_get_target_residency(int cpu, int state)
-{
-	struct cpuidle_device *dev = per_cpu(cpuidle_devices, cpu);
-	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
-
-	if (!drv)
-		return INT_MAX;
-
-	return drv->states[state].target_residency;
-}
-
-int cpuidle_get_state_size(void)
-{
-	struct cpuidle_device *dev = per_cpu(cpuidle_devices, 0);
-	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
-
-	if (!drv)
-		return INT_MAX;
-
-	return drv->state_count;
-}
-
-unsigned int cpuidle_get_exit_latency(int cpu, int state)
-{
-	struct cpuidle_device *dev = per_cpu(cpuidle_devices, cpu);
-	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
-
-	if (!drv)
-		return INT_MAX;
-
-	return drv->states[state].exit_latency;
-}
-
-bool cpuidle_check_state_enable(unsigned int cpu, int state)
-{
-	struct cpuidle_device *dev = per_cpu(cpuidle_devices, cpu);
-	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
-	struct cpuidle_state *s = &drv->states[state];
-	struct cpuidle_state_usage *su = &dev->states_usage[state];
-
-	return s->disabled || su->disable;
 }
 
 /**
@@ -129,12 +85,12 @@ static int find_deepest_state(struct cpuidle_driver *drv,
 
 	for (i = 1; i < drv->state_count; i++) {
 		struct cpuidle_state *s = &drv->states[i];
+		struct cpuidle_state_usage *su = &dev->states_usage[i];
 
-		if (dev->states_usage[i].disable ||
-		    s->exit_latency <= latency_req ||
-		    s->exit_latency > max_latency ||
-		    (s->flags & forbidden_flags) ||
-		    (s2idle && !s->enter_s2idle))
+		if (s->disabled || su->disable || s->exit_latency <= latency_req
+		    || s->exit_latency > max_latency
+		    || (s->flags & forbidden_flags)
+		    || (s2idle && !s->enter_s2idle))
 			continue;
 
 		latency_req = s->exit_latency;
@@ -265,13 +221,10 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 		broadcast = false;
 	}
 
-	index = filter_cstate(dev->cpu, index);
-
 	/* Take note of the planned idle state. */
 	sched_idle_set_state(target_state, index);
 
 	trace_cpu_idle_rcuidle(index, dev->cpu);
-	dbg_snapshot_cpuidle(drv->states[index].desc, index, 0, DSS_FLAG_IN);
 	time_start = ns_to_ktime(local_clock());
 
 	stop_critical_timings();
@@ -280,8 +233,6 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 
 	sched_clock_idle_wakeup_event();
 	time_end = ns_to_ktime(local_clock());
-	dbg_snapshot_cpuidle(drv->states[index].desc, entered_state,
-			(int)ktime_to_us(ktime_sub(time_end, time_start)), DSS_FLAG_OUT);
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, dev->cpu);
 
 	/* The cpu is no longer idle or about to enter idle. */
@@ -297,17 +248,17 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 	if (!cpuidle_state_is_coupled(drv, index))
 		local_irq_enable();
 
+	diff = ktime_us_delta(time_end, time_start);
+	if (diff > INT_MAX)
+		diff = INT_MAX;
+
+	dev->last_residency = (int) diff;
+
 	if (entered_state >= 0) {
-		/*
-		 * Update cpuidle counters
-		 * This can be moved to within driver enter routine,
+		/* Update cpuidle counters */
+		/* This can be moved to within driver enter routine
 		 * but that results in multiple copies of same code.
 		 */
-		diff = ktime_us_delta(time_end, time_start);
-		if (diff > INT_MAX)
-			diff = INT_MAX;
-
-		dev->last_residency = (int)diff;
 		dev->states_usage[entered_state].time += dev->last_residency;
 		dev->states_usage[entered_state].usage++;
 	} else {
@@ -543,15 +494,11 @@ static void __cpuidle_device_init(struct cpuidle_device *dev)
  */
 static int __cpuidle_register_device(struct cpuidle_device *dev)
 {
+	int ret;
 	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
-	int i, ret;
 
 	if (!try_module_get(drv->owner))
 		return -EINVAL;
-
-	for (i = 0; i < drv->state_count; i++)
-		if (drv->states[i].disabled)
-			dev->states_usage[i].disable |= CPUIDLE_STATE_DISABLED_BY_DRIVER;
 
 	per_cpu(cpuidle_devices, dev->cpu) = dev;
 	list_add(&dev->device_list, &cpuidle_detected_devices);
@@ -708,16 +655,36 @@ EXPORT_SYMBOL_GPL(cpuidle_register);
 
 #ifdef CONFIG_SMP
 
+static void wake_up_idle_cpus(void *v)
+{
+	int cpu;
+	struct cpumask cpus;
+
+	preempt_disable();
+	if (v) {
+		cpumask_andnot(&cpus, v, cpu_isolated_mask);
+		cpumask_and(&cpus, &cpus, cpu_online_mask);
+	} else
+		cpumask_andnot(&cpus, cpu_online_mask, cpu_isolated_mask);
+
+	for_each_cpu(cpu, &cpus) {
+		if (cpu == smp_processor_id())
+			continue;
+		wake_up_if_idle(cpu);
+	}
+	preempt_enable();
+}
+
 /*
  * This function gets called when a part of the kernel has a new latency
- * requirement.  This means we need to get all processors out of their C-state,
- * and then recalculate a new suitable C-state. Just do a cross-cpu IPI; that
- * wakes them all right up.
+ * requirement.  This means we need to get only those processors out of their
+ * C-state for which qos requirement is changed, and then recalculate a new
+ * suitable C-state. Just do a cross-cpu IPI; that wakes them all right up.
  */
 static int cpuidle_latency_notify(struct notifier_block *b,
 		unsigned long l, void *v)
 {
-	wake_up_all_idle_cpus();
+	wake_up_idle_cpus(v);
 	return NOTIFY_OK;
 }
 
@@ -755,5 +722,5 @@ static int __init cpuidle_init(void)
 	return 0;
 }
 
-module_param(off, int, 0644);
+module_param(off, int, 0444);
 core_initcall(cpuidle_init);

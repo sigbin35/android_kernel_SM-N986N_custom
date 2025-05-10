@@ -423,8 +423,10 @@ int memcg_expand_shrinker_maps(int new_id)
 		if (mem_cgroup_is_root(memcg))
 			continue;
 		ret = memcg_expand_one_shrinker_map(memcg, size, old_size);
-		if (ret)
+		if (ret) {
+			mem_cgroup_iter_break(NULL, memcg);
 			goto unlock;
+		}
 	}
 unlock:
 	if (!ret)
@@ -921,7 +923,7 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 				   struct mem_cgroup *prev,
 				   struct mem_cgroup_reclaim_cookie *reclaim)
 {
-	struct mem_cgroup_reclaim_iter *iter;
+	struct mem_cgroup_reclaim_iter *uninitialized_var(iter);
 	struct cgroup_subsys_state *css = NULL;
 	struct mem_cgroup *memcg = NULL;
 	struct mem_cgroup *pos = NULL;
@@ -3817,7 +3819,7 @@ static void __mem_cgroup_usage_unregister_event(struct mem_cgroup *memcg,
 	struct mem_cgroup_thresholds *thresholds;
 	struct mem_cgroup_threshold_ary *new;
 	unsigned long usage;
-	int i, j, size;
+	int i, j, size, entries;
 
 	mutex_lock(&memcg->thresholds_lock);
 
@@ -3837,13 +3839,19 @@ static void __mem_cgroup_usage_unregister_event(struct mem_cgroup *memcg,
 	__mem_cgroup_threshold(memcg, type == _MEMSWAP);
 
 	/* Calculate new number of threshold */
-	size = 0;
+	size = entries = 0;
 	for (i = 0; i < thresholds->primary->size; i++) {
 		if (thresholds->primary->entries[i].eventfd != eventfd)
 			size++;
+		else
+			entries++;
 	}
 
 	new = thresholds->spare;
+
+	/* If no items related to eventfd have been cleared, nothing to do */
+	if (!entries)
+		goto unlock;
 
 	/* Set thresholds array to NULL if we don't have thresholds */
 	if (!size) {
@@ -4172,7 +4180,6 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	unsigned int efd, cfd;
 	struct fd efile;
 	struct fd cfile;
-	struct dentry *cdentry;
 	const char *name;
 	char *endp;
 	int ret;
@@ -4224,16 +4231,6 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 		goto out_put_cfile;
 
 	/*
-	 * The control file must be a regular cgroup1 file. As a regular cgroup
-	 * file can't be renamed, it's safe to access its name afterwards.
-	 */
-	cdentry = cfile.file->f_path.dentry;
-	if (cdentry->d_sb->s_type != &cgroup_fs_type || !d_is_reg(cdentry)) {
-		ret = -EINVAL;
-		goto out_put_cfile;
-	}
-
-	/*
 	 * Determine the event callbacks and set them in @event.  This used
 	 * to be done via struct cftype but cgroup core no longer knows
 	 * about these events.  The following is crude but the whole thing
@@ -4241,7 +4238,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 *
 	 * DO NOT ADD NEW FILES.
 	 */
-	name = cdentry->d_name.name;
+	name = cfile.file->f_path.dentry->d_name.name;
 
 	if (!strcmp(name, "memory.usage_in_bytes")) {
 		event->register_event = mem_cgroup_usage_register_event;
@@ -4265,7 +4262,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 * automatically removed on cgroup destruction but the removal is
 	 * asynchronous, so take an extra ref on @css.
 	 */
-	cfile_css = css_tryget_online_from_dir(cdentry->d_parent,
+	cfile_css = css_tryget_online_from_dir(cfile.file->f_path.dentry->d_parent,
 					       &memory_cgrp_subsys);
 	ret = -EINVAL;
 	if (IS_ERR(cfile_css))
@@ -6385,20 +6382,6 @@ void mem_cgroup_sk_alloc(struct sock *sk)
 
 	if (!mem_cgroup_sockets_enabled)
 		return;
-
-	/*
-	 * Socket cloning can throw us here with sk_memcg already
-	 * filled. It won't however, necessarily happen from
-	 * process context. So the test for root memcg given
-	 * the current task's memcg won't help us in this case.
-	 *
-	 * Respecting the original socket's memcg is a better
-	 * decision in this case.
-	 */
-	if (sk->sk_memcg) {
-		css_get(&sk->sk_memcg->css);
-		return;
-	}
 
 	/* Do not associate the sock with unrelated interrupted task's memcg. */
 	if (in_interrupt())

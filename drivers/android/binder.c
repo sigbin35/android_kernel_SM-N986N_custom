@@ -62,11 +62,11 @@
 #include <linux/nsproxy.h>
 #include <linux/poll.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/rbtree.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
-#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
@@ -74,7 +74,6 @@
 #include <linux/ratelimit.h>
 
 #include <uapi/linux/android/binder.h>
-#include <uapi/linux/android/binderfs.h>
 #include <uapi/linux/sched/types.h>
 
 #include <asm/cacheflush.h>
@@ -85,6 +84,16 @@
 
 #ifdef CONFIG_SAMSUNG_FREECESS
 #include <linux/freecess.h>
+#endif
+
+#ifdef CONFIG_FAST_TRACK
+#include <cpu/ftt/ftt.h>
+
+#define MAX_FG_WORKS_PROCEEDED 2
+
+static uint8_t binder_enable_fg_switch = 1;
+static atomic64_t binder_work_seq;
+static atomic64_t binder_fg_req_num;
 #endif
 
 int system_server_pid = 0;
@@ -134,7 +143,8 @@ enum {
 	BINDER_DEBUG_PRIORITY_CAP           = 1U << 13,
 	BINDER_DEBUG_SPINLOCKS              = 1U << 14,
 };
-static uint32_t binder_debug_mask = 0;
+static uint32_t binder_debug_mask = BINDER_DEBUG_USER_ERROR |
+	BINDER_DEBUG_FAILED_TRANSACTION | BINDER_DEBUG_DEAD_TRANSACTION;
 module_param_named(debug_mask, binder_debug_mask, uint, 0644);
 
 char *binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES;
@@ -156,7 +166,6 @@ static int binder_set_stop_on_user_error(const char *val,
 module_param_call(stop_on_user_error, binder_set_stop_on_user_error,
 	param_get_int, &binder_stop_on_user_error, 0644);
 
-#ifdef DEBUG
 #define binder_debug(mask, x...) \
 	do { \
 		if (binder_debug_mask & mask) \
@@ -170,16 +179,6 @@ module_param_call(stop_on_user_error, binder_set_stop_on_user_error,
 		if (binder_stop_on_user_error) \
 			binder_stop_on_user_error = 2; \
 	} while (0)
-#else
-static inline void binder_debug(uint32_t mask, const char *fmt, ...)
-{
-}
-static inline void binder_user_error(const char *fmt, ...)
-{
-	if (binder_stop_on_user_error)
-		binder_stop_on_user_error = 2;
-}
-#endif
 
 #define to_flat_binder_object(hdr) \
 	container_of(hdr, struct flat_binder_object, hdr)
@@ -204,7 +203,7 @@ enum binder_stat_types {
 };
 
 struct binder_stats {
-	atomic_t br[_IOC_NR(BR_ONEWAY_SPAM_SUSPECT) + 1];
+	atomic_t br[_IOC_NR(BR_FAILED_REPLY) + 1];
 	atomic_t bc[_IOC_NR(BC_REPLY_SG) + 1];
 	atomic_t obj_created[BINDER_STAT_COUNT];
 	atomic_t obj_deleted[BINDER_STAT_COUNT];
@@ -258,13 +257,16 @@ struct binder_work {
 	enum binder_work_type {
 		BINDER_WORK_TRANSACTION = 1,
 		BINDER_WORK_TRANSACTION_COMPLETE,
- 		BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT,
 		BINDER_WORK_RETURN_ERROR,
 		BINDER_WORK_NODE,
 		BINDER_WORK_DEAD_BINDER,
 		BINDER_WORK_DEAD_BINDER_AND_CLEAR,
 		BINDER_WORK_CLEAR_DEATH_NOTIFICATION,
 	} type;
+
+#ifdef CONFIG_FAST_TRACK
+	uint64_t seq;
+#endif
 };
 
 struct binder_error {
@@ -485,20 +487,8 @@ struct binder_priority {
  *                        (protected by binder_deferred_lock)
  * @deferred_work:        bitmap of deferred work to perform
  *                        (protected by binder_deferred_lock)
- * @outstanding_txns:     number of transactions to be transmitted before
- *                        processes in freeze_wait are woken up
- *                        (protected by @inner_lock)
  * @is_dead:              process is dead and awaiting free
  *                        when outstanding transactions are cleaned up
- *                        (protected by @inner_lock)
- * @sync_recv:            process received sync transactions since last frozen
- *                        bit 0: received sync transaction after being frozen
- *                        bit 1: new pending sync transaction during freezing
- *                        (protected by @inner_lock)
- * @async_recv:           process received async transactions since last frozen
- *                        (protected by @inner_lock)
- * @freeze_wait:          waitqueue of processes waiting for all outstanding
- *                        transactions to be processed
  *                        (protected by @inner_lock)
  * @todo:                 list of work for this process
  *                        (protected by @inner_lock)
@@ -515,8 +505,7 @@ struct binder_priority {
  * @requested_threads_started: number binder threads started
  *                        (protected by @inner_lock)
  * @tmp_ref:              temporary reference to indicate proc is in use
- *                        (atomic since @proc->inner_lock cannot
- *                        always be acquired)
+ *                        (protected by @inner_lock)
  * @default_priority:     default scheduler priority
  *                        (invariant after initialized)
  * @debugfs_entry:        debugfs node
@@ -527,8 +516,6 @@ struct binder_priority {
  * @outer_lock:           no nesting under innor or node lock
  *                        Lock order: 1) outer, 2) node, 3) inner
  * @binderfs_entry:       process-specific binderfs log file
- * @oneway_spam_detection_enabled: process enabled oneway spam detection
- *                        or not
  *
  * Bookkeeping structure for binder processes
  */
@@ -546,20 +533,19 @@ struct binder_proc {
 	const struct cred *cred;
 	struct hlist_node deferred_work_node;
 	int deferred_work;
-	int outstanding_txns;
 	bool is_dead;
-	bool is_frozen;
-	bool sync_recv;
-	bool async_recv;
-	wait_queue_head_t freeze_wait;
 
 	struct list_head todo;
+#ifdef CONFIG_FAST_TRACK
+	struct list_head fg_todo;
+	uint32_t fg_count;
+#endif
 	struct binder_stats stats;
 	struct list_head delivered_death;
 	int max_threads;
 	int requested_threads;
 	int requested_threads_started;
-	atomic_t tmp_ref;
+	int tmp_ref;
 	struct binder_priority default_priority;
 	struct dentry *debugfs_entry;
 	struct binder_alloc alloc;
@@ -567,7 +553,6 @@ struct binder_proc {
 	spinlock_t inner_lock;
 	spinlock_t outer_lock;
 	struct dentry *binderfs_entry;
-	bool oneway_spam_detection_enabled;
 };
 
 enum {
@@ -811,98 +796,6 @@ _binder_node_inner_unlock(struct binder_node *node, int line)
 	spin_unlock(&node->lock);
 }
 
-#ifdef CONFIG_DEBUG_SNAPSHOT_BINDER
-/*
- * Binder Debug Snapshot
- */
-static void init_binder_transaction_base(int type, struct trace_binder_transaction_base *base,
-					 struct binder_transaction *t, struct binder_thread *from,
-					 struct binder_thread *to)
-{
-	struct binder_thread *t_from;
-	struct binder_thread *t_to;
-
-	if (base == NULL)
-		return;
-
-	t_from = t->from ? t->from : (from ? from : NULL);
-	t_to = t->to_thread ? t->to_thread : (to ? to : NULL);
-	base->trace_type = type;
-	base->transaction_id = t->debug_id;
-	base->from_pid = t_from ? t_from->proc->pid : 0;
-	base->from_tid = t_from ? t_from->pid : 0;
-	base->to_pid = t->to_proc ? t->to_proc->pid : 0;
-	base->to_tid = t_to ? t_to->pid : 0;
-	if (t_from) {
-		strncpy(base->from_pid_comm, t_from->proc->tsk->comm, TASK_COMM_LEN);
-		strncpy(base->from_tid_comm, t_from->task->comm, TASK_COMM_LEN);
-	} else {
-		base->from_pid_comm[0] = '\0';
-		base->from_tid_comm[0] = '\0';
-	}
-	if (t->to_proc)
-		strncpy(base->to_pid_comm, t->to_proc->tsk->comm, TASK_COMM_LEN);
-	else
-		base->to_pid_comm[0] = '\0';
-	if (t_to)
-		strncpy(base->to_tid_comm, t_to->task->comm, TASK_COMM_LEN);
-	else
-		base->to_tid_comm[0] = '\0';
-}
-
-static void dss_binder_transaction(int reply, struct binder_transaction *t, struct binder_thread *from, int to_node_id)
-{
-	struct trace_binder_transaction_base base;
-	struct trace_binder_transaction transaction;
-
-	init_binder_transaction_base(TRANSACTION, &base, t, from, NULL);
-	transaction.to_node_id = to_node_id;
-	transaction.reply = reply;
-	transaction.flags = t->flags;
-	transaction.code = t->code;
-
-	dbg_snapshot_binder(&base, &transaction, NULL);
-}
-
-static void dss_binder_transaction_received(struct binder_transaction *t, struct binder_thread *to)
-{
-	struct trace_binder_transaction_base base;
-
-	init_binder_transaction_base(TRANSACTION_DONE, &base, t, NULL, to);
-
-	dbg_snapshot_binder(&base, NULL, NULL);
-}
-
-static void dss_binder_transaction_failed(int reply, struct binder_transaction_log_entry *e,
-					  char *from_pid_comm, char *from_tid_comm,
-					  unsigned int flags, unsigned int code)
-{
-	struct trace_binder_transaction_base base;
-	struct trace_binder_transaction transaction;
-	struct trace_binder_transaction_error error;
-
-	base.trace_type = TRANSACTION_ERROR;
-	base.transaction_id = e->debug_id;
-	base.from_pid = e->from_proc;
-	base.from_tid = e->from_thread;
-	base.to_pid = e->to_proc;
-	base.to_tid = e->to_thread;
-	strncpy(base.from_pid_comm, from_pid_comm, TASK_COMM_LEN);
-	strncpy(base.from_tid_comm, from_tid_comm, TASK_COMM_LEN);
-	base.to_pid_comm[0] = '\0';
-	base.to_tid_comm[0] = '\0';
-	transaction.to_node_id = e->to_node;
-	transaction.reply = reply;
-	transaction.flags = flags;
-	transaction.code = code;
-	error.return_error = e->return_error;
-	error.return_error_param = e->return_error_param;
-	error.return_error_line = e->return_error_line;
-
-	dbg_snapshot_binder(&base, &transaction, &error);
-}
-#endif /* CONFIG_DEBUG_SNAPSHOT_BINDER */
-
 static bool binder_worklist_empty_ilocked(struct list_head *list)
 {
 	return list_empty(list);
@@ -942,6 +835,9 @@ binder_enqueue_work_ilocked(struct binder_work *work,
 {
 	BUG_ON(target_list == NULL);
 	BUG_ON(work->entry.next && !list_empty(&work->entry));
+#ifdef CONFIG_FAST_TRACK
+	work->seq = (uint64_t)atomic64_inc_return(&binder_work_seq);
+#endif
 	list_add_tail(&work->entry, target_list);
 }
 
@@ -1033,6 +929,104 @@ static struct binder_work *binder_dequeue_work_head_ilocked(
 	return w;
 }
 
+#ifdef CONFIG_FAST_TRACK
+static int binder_switch_show(struct seq_file *m, void *unused)
+{
+	seq_printf(m, "%u\n", binder_enable_fg_switch);
+	return 0;
+}
+
+static int binder_switch_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, binder_switch_show, inode->i_private);
+}
+
+static ssize_t binder_switch_write(struct file *file, const char __user *buffer,
+	size_t count, loff_t *pos)
+{
+	char enable;
+
+	if (count > 0) {
+		if (get_user(enable, buffer))
+			return -EFAULT;
+
+		if (enable == '0')
+			binder_enable_fg_switch = 0;
+		else if (enable == '1')
+			binder_enable_fg_switch = 1;
+		else if (enable == '2')
+			binder_enable_fg_switch = 2;
+		else
+			return -EINVAL;
+	}
+
+	return count;
+}
+
+static const struct file_operations binder_switch_fops = {
+	.owner = THIS_MODULE,
+	.open = binder_switch_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.write = binder_switch_write,
+};
+
+static inline bool binder_proc_worklist_empty_ilocked(struct binder_proc *proc)
+{
+	return binder_worklist_empty_ilocked(&proc->todo) &&
+		binder_worklist_empty_ilocked(&proc->fg_todo);
+}
+
+static inline struct list_head *binder_proc_select_worklist_ilocked(
+	struct binder_proc *proc)
+{
+	if (binder_worklist_empty_ilocked(&proc->fg_todo)) {
+		proc->fg_count = 0;
+		return &proc->todo;
+	}
+
+	if (proc->fg_count >= MAX_FG_WORKS_PROCEEDED) {
+		proc->fg_count = 0;
+
+		if (!binder_worklist_empty_ilocked(&proc->todo)) {
+			struct binder_work *fg_w;
+			struct binder_work *w;
+
+			fg_w = list_first_entry(&proc->fg_todo,
+				struct binder_work, entry);
+			w = list_first_entry(&proc->todo,
+				struct binder_work, entry);
+
+			if (w->seq < fg_w->seq)
+				return &proc->todo;
+		}
+	}
+
+	proc->fg_count++;
+	return &proc->fg_todo;
+}
+static inline int is_static_ftt(struct sched_entity *se)
+{
+	return se->ftt_mark;
+}
+
+static inline int ftt_binder_enqueue(struct binder_thread *thread,
+                                        struct binder_thread *from)
+{
+	if (from && is_ftt(&from->task->se) &&
+		!is_ftt(&thread->task->se) && binder_enable_fg_switch)
+		return dynamic_ftt_enqueue(thread->task, DYNAMIC_FTT_BINDER);
+	return -1;
+}
+
+static inline void ftt_binder_dequeue(struct binder_thread *thread)
+{
+	if (is_dyn_ftt(&thread->task->se, DYNAMIC_FTT_BINDER))
+		dynamic_ftt_dequeue(thread->task, DYNAMIC_FTT_BINDER);
+}
+#endif
+
 static void
 binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer);
 static void binder_free_thread(struct binder_thread *thread);
@@ -1105,7 +1099,11 @@ static bool binder_has_work_ilocked(struct binder_thread *thread,
 	return thread->process_todo ||
 		thread->looper_need_return ||
 		(do_proc_work &&
+#ifdef CONFIG_FAST_TRACK
+		 !binder_proc_worklist_empty_ilocked(thread->proc));
+#else
 		 !binder_worklist_empty_ilocked(&thread->proc->todo));
+#endif
 }
 
 static bool binder_has_work(struct binder_thread *thread, bool do_proc_work)
@@ -1137,6 +1135,12 @@ static void binder_wakeup_poll_threads_ilocked(struct binder_proc *proc,
 		thread = rb_entry(n, struct binder_thread, rb_node);
 		if (thread->looper & BINDER_LOOPER_STATE_POLL &&
 		    binder_available_for_proc_work_ilocked(thread)) {
+#ifdef CONFIG_SCHED_WALT
+			if (sync && thread->task && thread->task->signal &&
+				(thread->task->signal->oom_score_adj <= 0)) {
+				thread->task->low_latency = true;
+			}
+#endif
 			if (sync)
 				wake_up_interruptible_sync(&thread->wait);
 			else
@@ -1196,6 +1200,11 @@ static void binder_wakeup_thread_ilocked(struct binder_proc *proc,
 	assert_spin_locked(&proc->inner_lock);
 
 	if (thread) {
+#ifdef CONFIG_SCHED_WALT
+		if (sync && thread->task && thread->task->signal &&
+			(thread->task->signal->oom_score_adj <= 0))
+			thread->task->low_latency = true;
+#endif
 		if (sync)
 			wake_up_interruptible_sync(&thread->wait);
 		else
@@ -1287,8 +1296,8 @@ static void binder_do_set_priority(struct task_struct *task,
 		long min_nice = rlimit_to_nice(task_rlimit(task, RLIMIT_NICE));
 
 		if (min_nice > MAX_NICE) {
-			binder_user_error("%d(%s) RLIMIT_NICE not set\n",
-					  task->pid, task->comm);
+			binder_user_error("%d RLIMIT_NICE not set\n",
+					  task->pid);
 			return;
 		} else if (priority < min_nice) {
 			priority = min_nice;
@@ -1298,8 +1307,8 @@ static void binder_do_set_priority(struct task_struct *task,
 	if (policy != desired.sched_policy ||
 	    to_kernel_prio(policy, priority) != desired.prio)
 		binder_debug(BINDER_DEBUG_PRIORITY_CAP,
-			     "%d(%s): priority %d not allowed, using %d instead\n",
-			      task->pid, task->comm, desired.prio,
+			     "%d: priority %d not allowed, using %d instead\n",
+			      task->pid, desired.prio,
 			      to_kernel_prio(policy, priority));
 
 	trace_binder_set_priority(task->tgid, task->pid, task->normal_prio,
@@ -1338,7 +1347,13 @@ static void binder_transaction_priority(struct task_struct *task,
 					bool inherit_rt)
 {
 	struct binder_priority desired_prio = t->priority;
+	desired_prio.prio = t->priority.prio;
+	desired_prio.sched_policy = t->priority.sched_policy;
 
+	/*
+	 * To resolve all possible priority inversions.
+	 */
+	inherit_rt = true;
 	if (t->set_priority_called)
 		return;
 
@@ -1461,8 +1476,8 @@ static struct binder_node *binder_init_node_ilocked(
 	INIT_LIST_HEAD(&node->work.entry);
 	INIT_LIST_HEAD(&node->async_todo);
 	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
-		     "%d:%d(%s:%s) node %d u%016llx c%016llx created\n",
-		     proc->pid, current->pid, proc->tsk->comm, current->comm, node->debug_id,
+		     "%d:%d node %d u%016llx c%016llx created\n",
+		     proc->pid, current->pid, node->debug_id,
 		     (u64)node->ptr, (u64)node->cookie);
 
 	return node;
@@ -1798,8 +1813,8 @@ static struct binder_ref *binder_get_ref_for_node_olocked(
 	hlist_add_head(&new_ref->node_entry, &node->refs);
 
 	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
-		     "%d(%s) new ref %d desc %d for node %d\n",
-		      proc->pid, proc->tsk->comm, new_ref->data.debug_id, new_ref->data.desc,
+		     "%d new ref %d desc %d for node %d\n",
+		      proc->pid, new_ref->data.debug_id, new_ref->data.desc,
 		      node->debug_id);
 	binder_node_unlock(node);
 	return new_ref;
@@ -1810,8 +1825,8 @@ static void binder_cleanup_ref_olocked(struct binder_ref *ref)
 	bool delete_node = false;
 
 	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
-		     "%d(%s) delete ref %d desc %d for node %d\n",
-		      ref->proc->pid, ref->proc->tsk->comm, ref->data.debug_id, ref->data.desc,
+		     "%d delete ref %d desc %d for node %d\n",
+		      ref->proc->pid, ref->data.debug_id, ref->data.desc,
 		      ref->node->debug_id);
 
 	rb_erase(&ref->rb_node_desc, &ref->proc->refs_by_desc);
@@ -1838,8 +1853,8 @@ static void binder_cleanup_ref_olocked(struct binder_ref *ref)
 
 	if (ref->death) {
 		binder_debug(BINDER_DEBUG_DEAD_BINDER,
-			     "%d(%s) delete ref %d desc %d has death notification\n",
-			      ref->proc->pid, ref->proc->tsk->comm, ref->data.debug_id,
+			     "%d delete ref %d desc %d has death notification\n",
+			      ref->proc->pid, ref->data.debug_id,
 			      ref->data.desc);
 		binder_dequeue_work(ref->proc, &ref->death->work);
 		binder_stats_deleted(BINDER_STAT_DEATH);
@@ -1893,8 +1908,8 @@ static bool binder_dec_ref_olocked(struct binder_ref *ref, int strong)
 {
 	if (strong) {
 		if (ref->data.strong == 0) {
-			binder_user_error("%d(%s) invalid dec strong, ref %d desc %d s %d w %d\n",
-					  ref->proc->pid, ref->proc->tsk->comm, ref->data.debug_id,
+			binder_user_error("%d invalid dec strong, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
 					  ref->data.desc, ref->data.strong,
 					  ref->data.weak);
 			return false;
@@ -1904,8 +1919,8 @@ static bool binder_dec_ref_olocked(struct binder_ref *ref, int strong)
 			binder_dec_node(ref->node, strong, 1);
 	} else {
 		if (ref->data.weak == 0) {
-			binder_user_error("%d(%s) invalid dec weak, ref %d desc %d s %d w %d\n",
-					  ref->proc->pid, ref->proc->tsk->comm, ref->data.debug_id,
+			binder_user_error("%d invalid dec weak, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
 					  ref->data.desc, ref->data.strong,
 					  ref->data.weak);
 			return false;
@@ -2149,9 +2164,9 @@ static void binder_thread_dec_tmpref(struct binder_thread *thread)
 static void binder_proc_dec_tmpref(struct binder_proc *proc)
 {
 	binder_inner_proc_lock(proc);
-	atomic_dec(&proc->tmp_ref);
+	proc->tmp_ref--;
 	if (proc->is_dead && RB_EMPTY_ROOT(&proc->threads) &&
-			!atomic_read(&proc->tmp_ref)) {
+			!proc->tmp_ref) {
 		binder_inner_proc_unlock(proc);
 		binder_free_proc(proc);
 		return;
@@ -2213,30 +2228,18 @@ static struct binder_thread *binder_get_txn_from_and_acq_inner(
 
 static void binder_free_transaction(struct binder_transaction *t)
 {
-	struct binder_proc *target_proc;
+	struct binder_proc *target_proc = t->to_proc;
 
-	spin_lock(&t->lock);
-	target_proc = t->to_proc;
 	if (target_proc) {
-		atomic_inc(&target_proc->tmp_ref);
-		spin_unlock(&t->lock);
-
 		binder_inner_proc_lock(target_proc);
-		target_proc->outstanding_txns--;
-		BUG_ON(target_proc->outstanding_txns < 0);
-		if (!target_proc->outstanding_txns && target_proc->is_frozen)
-			wake_up_interruptible_all(&target_proc->freeze_wait);
 		if (t->buffer)
 			t->buffer->transaction = NULL;
 		binder_inner_proc_unlock(target_proc);
-		binder_proc_dec_tmpref(target_proc);
-	} else {
-		/*
-		 * If the transaction has no target_proc, then
-		 * t->buffer->transaction * has already been cleared.
-		 */
-		spin_unlock(&t->lock);
 	}
+	/*
+	 * If the transaction has no target_proc, then
+	 * t->buffer->transaction has already been cleared.
+	 */
 	kfree(t);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION);
 }
@@ -2252,12 +2255,10 @@ static void binder_send_failed_reply(struct binder_transaction *t,
 		target_thread = binder_get_txn_from_and_acq_inner(t);
 		if (target_thread) {
 			binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
-				     "send failed reply for transaction %d to %d:%d(%s:%s)\n",
+				     "send failed reply for transaction %d to %d:%d\n",
 				      t->debug_id,
 				      target_thread->proc->pid,
-				      target_thread->pid,
-				      target_thread->proc->tsk->comm,
-				      target_thread->task->comm);
+				      target_thread->pid);
 
 			binder_pop_transaction_ilocked(target_thread, t);
 			if (target_thread->reply_error.cmd == BR_OK) {
@@ -2512,8 +2513,8 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 	binder_size_t off_start_offset, buffer_offset, off_end_offset;
 
 	binder_debug(BINDER_DEBUG_TRANSACTION,
-		     "%d(%s) buffer release %d, size %zd-%zd, failed at %llx\n",
-		     proc->pid, proc->tsk->comm, buffer->debug_id,
+		     "%d buffer release %d, size %zd-%zd, failed at %llx\n",
+		     proc->pid, buffer->debug_id,
 		     buffer->data_size, buffer->offsets_size,
 		     (unsigned long long)failed_at);
 
@@ -2679,8 +2680,8 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 			return -ENOMEM;
 	}
 	if (fp->cookie != node->cookie) {
-		binder_user_error("%d:%d(%s:%s) sending u%016llx node %d, cookie mismatch %016llx != %016llx\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)fp->binder,
+		binder_user_error("%d:%d sending u%016llx node %d, cookie mismatch %016llx != %016llx\n",
+				  proc->pid, thread->pid, (u64)fp->binder,
 				  node->debug_id, (u64)fp->cookie,
 				  (u64)node->cookie);
 		ret = -EINVAL;
@@ -2728,8 +2729,8 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 	node = binder_get_node_from_ref(proc, fp->handle,
 			fp->hdr.type == BINDER_TYPE_HANDLE, &src_rdata);
 	if (!node) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid handle, %d\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, fp->handle);
+		binder_user_error("%d:%d got transaction with invalid handle, %d\n",
+				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
 	}
 	if (security_binder_transfer_binder(proc->cred, target_proc->cred)) {
@@ -2801,8 +2802,8 @@ static int binder_translate_fd(int fd,
 	else
 		target_allows_fd = t->buffer->target_node->accept_fds;
 	if (!target_allows_fd) {
-		binder_user_error("%d:%d(%s:%s) got %s with fd, %d, but target does not allow fds\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+		binder_user_error("%d:%d got %s with fd, %d, but target does not allow fds\n",
+				  proc->pid, thread->pid,
 				  in_reply_to ? "reply" : "transaction",
 				  fd);
 		ret = -EPERM;
@@ -2811,8 +2812,8 @@ static int binder_translate_fd(int fd,
 
 	file = fget(fd);
 	if (!file) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid fd, %d\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, fd);
+		binder_user_error("%d:%d got transaction with invalid fd, %d\n",
+				  proc->pid, thread->pid, fd);
 		ret = -EBADF;
 		goto err_fget;
 	}
@@ -2856,15 +2857,15 @@ static int binder_translate_fd_array(struct binder_fd_array_object *fda,
 
 	fd_buf_size = sizeof(u32) * fda->num_fds;
 	if (fda->num_fds >= SIZE_MAX / sizeof(u32)) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid number of fds (%lld)\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)fda->num_fds);
+		binder_user_error("%d:%d got transaction with invalid number of fds (%lld)\n",
+				  proc->pid, thread->pid, (u64)fda->num_fds);
 		return -EINVAL;
 	}
 	if (fd_buf_size > parent->length ||
 	    fda->parent_offset > parent->length - fd_buf_size) {
 		/* No space for all file descriptors here. */
-		binder_user_error("%d:%d(%s:%s) not enough space to store %lld fds in buffer\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)fda->num_fds);
+		binder_user_error("%d:%d not enough space to store %lld fds in buffer\n",
+				  proc->pid, thread->pid, (u64)fda->num_fds);
 		return -EINVAL;
 	}
 	/*
@@ -2877,8 +2878,8 @@ static int binder_translate_fd_array(struct binder_fd_array_object *fda,
 	fda_offset = (parent->buffer - (uintptr_t)t->buffer->user_data) +
 		fda->parent_offset;
 	if (!IS_ALIGNED((unsigned long)fda_offset, sizeof(u32))) {
-		binder_user_error("%d:%d(%s:%s) parent offset not aligned correctly.\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d parent offset not aligned correctly.\n",
+				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
 	for (fdi = 0; fdi < fda->num_fds; fdi++) {
@@ -2923,11 +2924,11 @@ static void print_binder_proc_inner(struct binder_proc *proc)
 	struct binder_transaction *t;
 	struct binder_buffer *buffer;
 	uint32_t cnt = 1; 
-	
+
 	binder_inner_proc_lock(proc);
 	for (pn = rb_first(&proc->threads); pn != NULL; pn = rb_next(pn)) {
 		p_thread = rb_entry(pn, struct binder_thread, rb_node);
-		t = p_thread->transaction_stack;                   
+		t = p_thread->transaction_stack;
 		if (t) {
 			spin_lock(&t->lock);  
 			if (t->from != p_thread && t->to_thread == p_thread) { //incoming transaction
@@ -2945,11 +2946,11 @@ static void print_binder_proc_inner(struct binder_proc *proc)
 						t->from ? t->from->pid : 0,
 						t->to_proc ? t->to_proc->pid : 0,
 						t->to_thread ? t->to_thread->pid : 0);
-				}      
+				}
 				cnt++;
 			}
 			spin_unlock(&t->lock);
-		}                
+		}
 	}
 	binder_inner_proc_unlock(proc);
 }
@@ -2978,8 +2979,8 @@ static int binder_fixup_parent(struct binder_transaction *t,
 				     off_start_offset, &parent_offset,
 				     num_valid);
 	if (!parent) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid parent offset or type\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d got transaction with invalid parent offset or type\n",
+				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
 
@@ -2987,16 +2988,16 @@ static int binder_fixup_parent(struct binder_transaction *t,
 				   parent_offset, bp->parent_offset,
 				   last_fixup_obj_off,
 				   last_fixup_min_off)) {
-		binder_user_error("%d:%d(%s:%s) got transaction with out-of-order buffer fixup\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d got transaction with out-of-order buffer fixup\n",
+				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
 
 	if (parent->length < sizeof(binder_uintptr_t) ||
 	    bp->parent_offset > parent->length - sizeof(binder_uintptr_t)) {
 		/* No space for a pointer here! */
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid parent offset\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d got transaction with invalid parent offset\n",
+				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
 	buffer_offset = bp->parent_offset +
@@ -3021,11 +3022,10 @@ static int binder_fixup_parent(struct binder_transaction *t,
  * If the @thread parameter is not NULL, the transaction is always queued
  * to the waitlist of that specific thread.
  *
- * Return:	0 if the transaction was successfully queued
- *		BR_DEAD_REPLY if the target process or thread is dead
- *		BR_FROZEN_REPLY if the target process or thread is frozen
+ * Return:	true if the transactions was successfully queued
+ *		false if the target process or thread is dead
  */
-static int binder_proc_transaction(struct binder_transaction *t,
+static bool binder_proc_transaction(struct binder_transaction *t,
 				    struct binder_proc *proc,
 				    struct binder_thread *thread)
 {
@@ -3049,18 +3049,11 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	}
 
 	binder_inner_proc_lock(proc);
-	if (proc->is_frozen) {
-		proc->sync_recv |= !oneway;
-		proc->async_recv |= oneway;
-	}
 
-	if ((proc->is_frozen && !oneway) || proc->is_dead ||
-			(thread && thread->is_dead)) {
-		bool proc_is_dead = proc->is_dead
-			|| (thread && thread->is_dead);
+	if (proc->is_dead || (thread && thread->is_dead)) {
 		binder_inner_proc_unlock(proc);
 		binder_node_unlock(node);
-		return proc_is_dead ? BR_DEAD_REPLY : BR_FROZEN_REPLY;
+		return false;
 	}
 
 	if (!thread && !pending_async)
@@ -3069,8 +3062,18 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	if (thread) {
 		binder_transaction_priority(thread->task, t, node_prio,
 					    node->inherit_rt);
+#ifdef CONFIG_FAST_TRACK
+		ftt_binder_enqueue(thread, t->from);
+#endif
 		binder_enqueue_thread_work_ilocked(thread, &t->work);
 	} else if (!pending_async) {
+#ifdef CONFIG_FAST_TRACK
+		if (is_ftt(&current->se) && !oneway &&
+			binder_enable_fg_switch) {
+			binder_enqueue_work_ilocked(&t->work, &proc->fg_todo);
+			atomic64_inc(&binder_fg_req_num);
+		} else
+#endif
 		binder_enqueue_work_ilocked(&t->work, &proc->todo);
 	} else {
 		binder_enqueue_work_ilocked(&t->work, &node->async_todo);
@@ -3079,11 +3082,10 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	if (!pending_async)
 		binder_wakeup_thread_ilocked(proc, thread, !oneway /* sync */);
 
-	proc->outstanding_txns++;
 	binder_inner_proc_unlock(proc);
 	binder_node_unlock(node);
 
-	return 0;
+	return true;
 }
 
 /**
@@ -3119,7 +3121,7 @@ static struct binder_node *binder_get_node_refs_for_txn(
 		target_node = node;
 		binder_inc_node_nilocked(node, 1, 0, NULL);
 		binder_inc_node_tmpref_ilocked(node);
-		atomic_inc(&node->proc->tmp_ref);
+		node->proc->tmp_ref++;
 		*procp = node->proc;
 	} else
 		*error = BR_DEAD_REPLY;
@@ -3134,13 +3136,13 @@ static struct binder_node *binder_get_node_refs_for_txn(
 // 3) Java layer uses 2 bytes char. And only the first byte has the data. (p+=2)
 // 4) Parcel::writeInterfaceToken() in frameworks/native/libs/binder/Parcel.cpp
 static void freecess_async_binder_report(struct binder_proc *proc,
-								struct binder_proc *target_proc,
-								struct binder_transaction_data *tr,
-								struct binder_transaction *t)
+						struct binder_proc *target_proc,
+						struct binder_transaction_data *tr,
+						struct binder_transaction *t)
 {
-    char buf_user[INTERFACETOKEN_BUFF_SIZE] = {0};
+	char buf_user[INTERFACETOKEN_BUFF_SIZE] = {0};
 	char buf[INTERFACETOKEN_BUFF_SIZE] = {0};
-    char *p = NULL;
+	char *p = NULL;
 	int i = 0;
 	int j = 0;
 	int skip_bytes = 8;
@@ -3163,7 +3165,7 @@ static void freecess_async_binder_report(struct binder_proc *proc,
 		if (thread_group_is_frozen(target_proc->tsk)) {
 			if (t->buffer->data_size > skip_bytes) {
 				if (0 == copy_from_user(buf_user, (const void __user *)(uintptr_t)tr->data.ptr.buffer,
-					min_t(binder_size_t, tr->data_size, INTERFACETOKEN_BUFF_SIZE - 1))) {
+					min_t(binder_size_t, tr->data_size, INTERFACETOKEN_BUFF_SIZE - 2))) {
 					p = &buf_user[skip_bytes];
 					i = 0;
 					j = skip_bytes + 1;
@@ -3181,8 +3183,8 @@ static void freecess_async_binder_report(struct binder_proc *proc,
 }
 
 static void freecess_sync_binder_report(struct binder_proc *proc,
-								struct binder_proc *target_proc,
-								struct binder_transaction_data *tr)
+						struct binder_proc *target_proc,
+						struct binder_transaction_data *tr)
 {
 	if (!proc || !target_proc || !tr)
 		return;
@@ -3234,15 +3236,15 @@ static void binder_transaction(struct binder_proc *proc,
 	e->target_handle = tr->target.handle;
 	e->data_size = tr->data_size;
 	e->offsets_size = tr->offsets_size;
-	strscpy(e->context_name, proc->context->name, BINDERFS_MAX_NAME);
+	e->context_name = proc->context->name;
 
 	if (reply) {
 		binder_inner_proc_lock(proc);
 		in_reply_to = thread->transaction_stack;
 		if (in_reply_to == NULL) {
 			binder_inner_proc_unlock(proc);
-			binder_user_error("%d:%d(%s:%s) got reply transaction with no transaction stack\n",
-					  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+			binder_user_error("%d:%d got reply transaction with no transaction stack\n",
+					  proc->pid, thread->pid);
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPROTO;
 			return_error_line = __LINE__;
@@ -3250,18 +3252,12 @@ static void binder_transaction(struct binder_proc *proc,
 		}
 		if (in_reply_to->to_thread != thread) {
 			spin_lock(&in_reply_to->lock);
-			binder_user_error("%d:%d(%s:%s) got reply transaction with bad transaction stack, transaction %d has target %d:%d(%s:%s)\n",
-				proc->pid, thread->pid,
-				proc->tsk->comm, thread->task->comm,
-				in_reply_to->debug_id,
+			binder_user_error("%d:%d got reply transaction with bad transaction stack, transaction %d has target %d:%d\n",
+				proc->pid, thread->pid, in_reply_to->debug_id,
 				in_reply_to->to_proc ?
 				in_reply_to->to_proc->pid : 0,
 				in_reply_to->to_thread ?
-				in_reply_to->to_thread->pid : 0,
-				in_reply_to->to_proc ?
-				in_reply_to->to_proc->tsk->comm : "",
-				in_reply_to->to_thread ?
-				in_reply_to->to_thread->task->comm : "");
+				in_reply_to->to_thread->pid : 0);
 			spin_unlock(&in_reply_to->lock);
 			binder_inner_proc_unlock(proc);
 			return_error = BR_FAILED_REPLY;
@@ -3279,8 +3275,8 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		if (target_thread->transaction_stack != in_reply_to) {
-			binder_user_error("%d:%d(%s:%s) got reply transaction with bad target transaction stack %d, expected %d\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+			binder_user_error("%d:%d got reply transaction with bad target transaction stack %d, expected %d\n",
+				proc->pid, thread->pid,
 				target_thread->transaction_stack ?
 				target_thread->transaction_stack->debug_id : 0,
 				in_reply_to->debug_id);
@@ -3293,7 +3289,7 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		target_proc = target_thread->proc;
-		atomic_inc(&target_proc->tmp_ref);
+		target_proc->tmp_ref++;
 		binder_inner_proc_unlock(target_thread->proc);
 	} else {
 		if (tr->target.handle) {
@@ -3314,8 +3310,8 @@ static void binder_transaction(struct binder_proc *proc,
 						ref->node, &target_proc,
 						&return_error);
 			} else {
-				binder_user_error("%d:%d(%s:%s) got transaction to invalid handle\n",
-						  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d got transaction to invalid handle\n",
+						  proc->pid, thread->pid);
 				return_error = BR_FAILED_REPLY;
 			}
 			binder_proc_unlock(proc);
@@ -3347,9 +3343,11 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		e->to_node = target_node->debug_id;
+
 #ifdef CONFIG_SAMSUNG_FREECESS
 		freecess_sync_binder_report(proc, target_proc, tr);
 #endif
+
 		if (security_binder_transaction(proc->cred,
 						target_proc->cred) < 0) {
 			return_error = BR_FAILED_REPLY;
@@ -3387,14 +3385,11 @@ static void binder_transaction(struct binder_proc *proc,
 			tmp = thread->transaction_stack;
 			if (tmp->to_thread != thread) {
 				spin_lock(&tmp->lock);
-				binder_user_error("%d:%d(%s:%s) got new transaction with bad transaction stack, transaction %d has target %d:%d(%s:%s)\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
-					tmp->debug_id,
+				binder_user_error("%d:%d got new transaction with bad transaction stack, transaction %d has target %d:%d\n",
+					proc->pid, thread->pid, tmp->debug_id,
 					tmp->to_proc ? tmp->to_proc->pid : 0,
 					tmp->to_thread ?
-					tmp->to_thread->pid : 0,
-					tmp->to_proc ? tmp->to_proc->tsk->comm : "",
-					tmp->to_thread ? tmp->to_thread->task->comm : "");
+					tmp->to_thread->pid : 0);
 				spin_unlock(&tmp->lock);
 				binder_inner_proc_unlock(proc);
 				return_error = BR_FAILED_REPLY;
@@ -3447,18 +3442,18 @@ static void binder_transaction(struct binder_proc *proc,
 
 	if (reply)
 		binder_debug(BINDER_DEBUG_TRANSACTION,
-			     "%d:%d(%s:%s) BC_REPLY %d -> %d:%d(%s:%s), data %016llx-%016llx size %lld-%lld-%lld\n",
-			     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, t->debug_id,
-			     target_proc->pid, target_thread->pid, target_proc->tsk->comm, target_thread->task->comm,
+			     "%d:%d BC_REPLY %d -> %d:%d, data %016llx-%016llx size %lld-%lld-%lld\n",
+			     proc->pid, thread->pid, t->debug_id,
+			     target_proc->pid, target_thread->pid,
 			     (u64)tr->data.ptr.buffer,
 			     (u64)tr->data.ptr.offsets,
 			     (u64)tr->data_size, (u64)tr->offsets_size,
 			     (u64)extra_buffers_size);
 	else
 		binder_debug(BINDER_DEBUG_TRANSACTION,
-			     "%d:%d(%s:%s) BC_TRANSACTION %d -> %d(%s) - node %d, data %016llx-%016llx size %lld-%lld-%lld\n",
-			     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, t->debug_id,
-			     target_proc->pid, target_proc->tsk->comm, target_node->debug_id,
+			     "%d:%d BC_TRANSACTION %d -> %d - node %d, data %016llx-%016llx size %lld-%lld-%lld\n",
+			     proc->pid, thread->pid, t->debug_id,
+			     target_proc->pid, target_node->debug_id,
 			     (u64)tr->data.ptr.buffer,
 			     (u64)tr->data.ptr.offsets,
 			     (u64)tr->data_size, (u64)tr->offsets_size,
@@ -3486,28 +3481,26 @@ static void binder_transaction(struct binder_proc *proc,
 	if (target_node && target_node->txn_security_ctx) {
 		u32 secid;
 		size_t added_size;
+		int retries = 0;
 		int max_retries = 100;
 
 		security_cred_getsecid(proc->cred, &secid);
- retry_alloc:
+retry_lowmem:
 		ret = security_secid_to_secctx(secid, &secctx, &secctx_sz);
-		if (ret == -ENOMEM && max_retries-- > 0) {
-			struct page *dummy_page;
-
+		if (ret == -ENOMEM && retries++ < max_retries) {
 			/*
-			 * security_secid_to_secctx() can fail because of a
-			 * GFP_ATOMIC allocation in which case -ENOMEM is
-			 * returned. This needs to be retried, but there is
-			 * currently no way to tell userspace to retry so we
-			 * do it here. We make sure there is still available
-			 * memory first and then retry.
+			 * security_secid_to_secctx() can fail
+			 * because of a GFP_ATOMIC allocation in
+			 * which case -ENOMEM is returned. This needs
+			 * to be retried, but there is currently no
+			 * way to tell userspace to retry so we do
+			 * it here. Sleep briefly to allow the low
+			 * memory condition to resolve.
 			 */
-			dummy_page = alloc_page(GFP_KERNEL);
-			if (dummy_page) {
-				__free_page(dummy_page);
-				goto retry_alloc;
-			}
+			udelay(100);
+			goto retry_lowmem;
 		}
+
 		if (ret) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = ret;
@@ -3525,14 +3518,11 @@ static void binder_transaction(struct binder_proc *proc,
 		}
 	}
 
-#ifdef CONFIG_DEBUG_SNAPSHOT_BINDER
-	dss_binder_transaction(reply, t, t->from ? t->from : thread, target_node ? target_node->debug_id : 0);
-#endif
 	trace_binder_transaction(reply, t, target_node);
 
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
 		tr->offsets_size, extra_buffers_size,
-		!reply && (t->flags & TF_ONE_WAY), current->tgid);
+		!reply && (t->flags & TF_ONE_WAY));
 	if (IS_ERR(t->buffer)) {
 		/*
 		 * -ESRCH indicates VMA cleared. The target is dying.
@@ -3567,7 +3557,6 @@ static void binder_transaction(struct binder_proc *proc,
 	t->buffer->debug_id = t->debug_id;
 	t->buffer->transaction = t;
 	t->buffer->target_node = target_node;
-	t->buffer->clear_on_free = !!(t->flags & TF_CLEAR_BUF);
 	trace_binder_transaction_alloc_buf(t->buffer);
 
 	if (binder_alloc_copy_user_to_buffer(
@@ -3576,8 +3565,8 @@ static void binder_transaction(struct binder_proc *proc,
 				(const void __user *)
 					(uintptr_t)tr->data.ptr.buffer,
 				tr->data_size)) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid data ptr\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d got transaction with invalid data ptr\n",
+				proc->pid, thread->pid);
 		return_error = BR_FAILED_REPLY;
 		return_error_param = -EFAULT;
 		return_error_line = __LINE__;
@@ -3590,24 +3579,24 @@ static void binder_transaction(struct binder_proc *proc,
 				(const void __user *)
 					(uintptr_t)tr->data.ptr.offsets,
 				tr->offsets_size)) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid offsets ptr\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_user_error("%d:%d got transaction with invalid offsets ptr\n",
+				proc->pid, thread->pid);
 		return_error = BR_FAILED_REPLY;
 		return_error_param = -EFAULT;
 		return_error_line = __LINE__;
 		goto err_copy_data_failed;
 	}
 	if (!IS_ALIGNED(tr->offsets_size, sizeof(binder_size_t))) {
-		binder_user_error("%d:%d(%s:%s) got transaction with invalid offsets size, %lld\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)tr->offsets_size);
+		binder_user_error("%d:%d got transaction with invalid offsets size, %lld\n",
+				proc->pid, thread->pid, (u64)tr->offsets_size);
 		return_error = BR_FAILED_REPLY;
 		return_error_param = -EINVAL;
 		return_error_line = __LINE__;
 		goto err_bad_offset;
 	}
 	if (!IS_ALIGNED(extra_buffers_size, sizeof(u64))) {
-		binder_user_error("%d:%d(%s:%s) got transaction with unaligned buffers size, %lld\n",
-				  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+		binder_user_error("%d:%d got transaction with unaligned buffers size, %lld\n",
+				  proc->pid, thread->pid,
 				  (u64)extra_buffers_size);
 		return_error = BR_FAILED_REPLY;
 		return_error_param = -EINVAL;
@@ -3616,7 +3605,7 @@ static void binder_transaction(struct binder_proc *proc,
 	}
 
 #ifdef CONFIG_SAMSUNG_FREECESS
-	freecess_async_binder_report(proc, target_proc, tr, t);
+	freecess_async_binder_report(proc, target_proc, tr, t); 
 #endif
 
 	off_start_offset = ALIGN(tr->data_size, sizeof(void *));
@@ -3641,8 +3630,8 @@ static void binder_transaction(struct binder_proc *proc,
 		object_size = binder_get_object(target_proc, t->buffer,
 						object_offset, &object);
 		if (object_size == 0 || object_offset < off_min) {
-			binder_user_error("%d:%d(%s:%s) got transaction with invalid offset (%lld, min %lld max %lld) or object.\n",
-					  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+			binder_user_error("%d:%d got transaction with invalid offset (%lld, min %lld max %lld) or object.\n",
+					  proc->pid, thread->pid,
 					  (u64)object_offset,
 					  (u64)off_min,
 					  (u64)t->buffer->data_size);
@@ -3710,7 +3699,7 @@ static void binder_transaction(struct binder_proc *proc,
 			binder_size_t parent_offset;
 			struct binder_fd_array_object *fda =
 				to_binder_fd_array_object(hdr);
-			size_t num_valid = (buffer_offset - off_start_offset) /
+			size_t num_valid = (buffer_offset - off_start_offset) / 
 						sizeof(binder_size_t);
 			struct binder_buffer_object *parent =
 				binder_validate_ptr(target_proc, t->buffer,
@@ -3719,8 +3708,8 @@ static void binder_transaction(struct binder_proc *proc,
 						    &parent_offset,
 						    num_valid);
 			if (!parent) {
-				binder_user_error("%d:%d(%s:%s) got transaction with invalid parent offset or type\n",
-						  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d got transaction with invalid parent offset or type\n",
+						  proc->pid, thread->pid);
 				return_error = BR_FAILED_REPLY;
 				return_error_param = -EINVAL;
 				return_error_line = __LINE__;
@@ -3732,8 +3721,8 @@ static void binder_transaction(struct binder_proc *proc,
 						   fda->parent_offset,
 						   last_fixup_obj_off,
 						   last_fixup_min_off)) {
-				binder_user_error("%d:%d(%s:%s) got transaction with out-of-order buffer fixup\n",
-						  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d got transaction with out-of-order buffer fixup\n",
+						  proc->pid, thread->pid);
 				return_error = BR_FAILED_REPLY;
 				return_error_param = -EINVAL;
 				return_error_line = __LINE__;
@@ -3758,8 +3747,8 @@ static void binder_transaction(struct binder_proc *proc,
 			size_t num_valid;
 
 			if (bp->length > buf_left) {
-				binder_user_error("%d:%d(%s:%s) got transaction with too large buffer\n",
-						  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d got transaction with too large buffer\n",
+						  proc->pid, thread->pid);
 				return_error = BR_FAILED_REPLY;
 				return_error_param = -EINVAL;
 				return_error_line = __LINE__;
@@ -3772,8 +3761,8 @@ static void binder_transaction(struct binder_proc *proc,
 						(const void __user *)
 							(uintptr_t)bp->buffer,
 						bp->length)) {
-				binder_user_error("%d:%d(%s:%s) got transaction with invalid offsets ptr\n",
-						  proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d got transaction with invalid offsets ptr\n",
+						  proc->pid, thread->pid);
 				return_error_param = -EFAULT;
 				return_error = BR_FAILED_REPLY;
 				return_error_line = __LINE__;
@@ -3804,34 +3793,40 @@ static void binder_transaction(struct binder_proc *proc,
 			last_fixup_min_off = 0;
 		} break;
 		default:
-			binder_user_error("%d:%d(%s:%s) got transaction with invalid object type, %x\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, hdr->type);
+			binder_user_error("%d:%d got transaction with invalid object type, %x\n",
+				proc->pid, thread->pid, hdr->type);
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EINVAL;
 			return_error_line = __LINE__;
 			goto err_bad_object_type;
 		}
 	}
-	if (t->buffer->oneway_spam_suspect)
-		tcomplete->type = BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT;
-	else
-		tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
+	tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
 	t->work.type = BINDER_WORK_TRANSACTION;
 
 	if (reply) {
 		binder_enqueue_thread_work(thread, tcomplete);
 		binder_inner_proc_lock(target_proc);
 		if (target_thread->is_dead) {
-			return_error = BR_DEAD_REPLY;
 			binder_inner_proc_unlock(target_proc);
 			goto err_dead_proc_or_thread;
 		}
 		BUG_ON(t->buffer->async_transaction != 0);
 		binder_pop_transaction_ilocked(target_thread, in_reply_to);
 		binder_enqueue_thread_work_ilocked(target_thread, &t->work);
-		target_proc->outstanding_txns++;
 		binder_inner_proc_unlock(target_proc);
+#ifdef CONFIG_SCHED_WALT
+		if (target_thread->task && target_thread->task->signal &&
+			(target_thread->task->signal->oom_score_adj <= 0)) {
+			target_thread->task->low_latency = true;
+		}
+#endif
 		wake_up_interruptible_sync(&target_thread->wait);
+
+#ifdef CONFIG_FAST_TRACK
+		ftt_binder_dequeue(thread);
+#endif
+
 		binder_restore_priority(current, in_reply_to->saved_priority);
 		binder_free_transaction(in_reply_to);
 	} else if (!(t->flags & TF_ONE_WAY)) {
@@ -3849,9 +3844,7 @@ static void binder_transaction(struct binder_proc *proc,
 		t->from_parent = thread->transaction_stack;
 		thread->transaction_stack = t;
 		binder_inner_proc_unlock(proc);
-		return_error = binder_proc_transaction(t,
-				target_proc, target_thread);
-		if (return_error) {
+		if (!binder_proc_transaction(t, target_proc, target_thread)) {
 			binder_inner_proc_lock(proc);
 			binder_pop_transaction_ilocked(thread, t);
 			binder_inner_proc_unlock(proc);
@@ -3861,8 +3854,7 @@ static void binder_transaction(struct binder_proc *proc,
 		BUG_ON(target_node == NULL);
 		BUG_ON(t->buffer->async_transaction != 1);
 		binder_enqueue_thread_work(thread, tcomplete);
-		return_error = binder_proc_transaction(t, target_proc, NULL);
-		if (return_error)
+		if (!binder_proc_transaction(t, target_proc, NULL))
 			goto err_dead_proc_or_thread;
 	}
 	if (target_thread)
@@ -3879,6 +3871,7 @@ static void binder_transaction(struct binder_proc *proc,
 	return;
 
 err_dead_proc_or_thread:
+	return_error = BR_DEAD_REPLY;
 	return_error_line = __LINE__;
 	binder_dequeue_work(proc, tcomplete);
 err_translate_failed:
@@ -3910,6 +3903,10 @@ err_bad_call_stack:
 err_empty_call_stack:
 err_dead_binder:
 err_invalid_target_handle:
+#ifdef CONFIG_FAST_TRACK
+	if (reply)
+		ftt_binder_dequeue(thread);
+#endif
 	if (target_thread)
 		binder_thread_dec_tmpref(target_thread);
 	if (target_proc)
@@ -3920,9 +3917,8 @@ err_invalid_target_handle:
 	}
 
 	binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
-		     "%d:%d(%s:%s) transaction failed %d/%d, size %lld-%lld line %d\n",
-		     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
-		     return_error, return_error_param,
+		     "%d:%d transaction failed %d/%d, size %lld-%lld line %d\n",
+		     proc->pid, thread->pid, return_error, return_error_param,
 		     (u64)tr->data_size, (u64)tr->offsets_size,
 		     return_error_line);
 
@@ -3932,9 +3928,6 @@ err_invalid_target_handle:
 		e->return_error = return_error;
 		e->return_error_param = return_error_param;
 		e->return_error_line = return_error_line;
-#ifdef CONFIG_DEBUG_SNAPSHOT_BINDER
-		dss_binder_transaction_failed(reply, e, proc->tsk->comm, thread->task->comm, tr->flags, tr->code);
-#endif
 		fe = binder_transaction_log_add(&binder_transaction_log_failed);
 		*fe = *e;
 		/*
@@ -4012,8 +4005,8 @@ static int binder_thread_write(struct binder_proc *proc,
 						proc, target, increment, strong,
 						&rdata);
 			if (!ret && rdata.desc != target) {
-				binder_user_error("%d:%d(%s:%s) tried to acquire reference to desc %d, got %d instead\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				binder_user_error("%d:%d tried to acquire reference to desc %d, got %d instead\n",
+					proc->pid, thread->pid,
 					target, rdata.desc);
 			}
 			switch (cmd) {
@@ -4032,15 +4025,15 @@ static int binder_thread_write(struct binder_proc *proc,
 				break;
 			}
 			if (ret) {
-				binder_user_error("%d:%d(%s:%s) %s %d refcount change on invalid ref %d ret %d\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
-					debug_string, strong, target, ret);
+				binder_user_error("%d:%d %s %d refcount change on invalid ref %d ret %d\n",
+					proc->pid, thread->pid, debug_string,
+					strong, target, ret);
 				break;
 			}
 			binder_debug(BINDER_DEBUG_USER_REFS,
-				     "%d:%d(%s:%s) %s ref %d desc %d s %d w %d\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
-				     debug_string, rdata.debug_id, rdata.desc, rdata.strong,
+				     "%d:%d %s ref %d desc %d s %d w %d\n",
+				     proc->pid, thread->pid, debug_string,
+				     rdata.debug_id, rdata.desc, rdata.strong,
 				     rdata.weak);
 			break;
 		}
@@ -4059,8 +4052,8 @@ static int binder_thread_write(struct binder_proc *proc,
 			ptr += sizeof(binder_uintptr_t);
 			node = binder_get_node(proc, node_ptr);
 			if (node == NULL) {
-				binder_user_error("%d:%d(%s:%s) %s u%016llx no match\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				binder_user_error("%d:%d %s u%016llx no match\n",
+					proc->pid, thread->pid,
 					cmd == BC_INCREFS_DONE ?
 					"BC_INCREFS_DONE" :
 					"BC_ACQUIRE_DONE",
@@ -4068,8 +4061,8 @@ static int binder_thread_write(struct binder_proc *proc,
 				break;
 			}
 			if (cookie != node->cookie) {
-				binder_user_error("%d:%d(%s:%s) %s u%016llx node %d cookie mismatch %016llx != %016llx\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				binder_user_error("%d:%d %s u%016llx node %d cookie mismatch %016llx != %016llx\n",
+					proc->pid, thread->pid,
 					cmd == BC_INCREFS_DONE ?
 					"BC_INCREFS_DONE" : "BC_ACQUIRE_DONE",
 					(u64)node_ptr, node->debug_id,
@@ -4080,8 +4073,8 @@ static int binder_thread_write(struct binder_proc *proc,
 			binder_node_inner_lock(node);
 			if (cmd == BC_ACQUIRE_DONE) {
 				if (node->pending_strong_ref == 0) {
-					binder_user_error("%d:%d(%s:%s) BC_ACQUIRE_DONE node %d has no pending acquire request\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+					binder_user_error("%d:%d BC_ACQUIRE_DONE node %d has no pending acquire request\n",
+						proc->pid, thread->pid,
 						node->debug_id);
 					binder_node_inner_unlock(node);
 					binder_put_node(node);
@@ -4090,8 +4083,8 @@ static int binder_thread_write(struct binder_proc *proc,
 				node->pending_strong_ref = 0;
 			} else {
 				if (node->pending_weak_ref == 0) {
-					binder_user_error("%d:%d(%s:%s) BC_INCREFS_DONE node %d has no pending increfs request\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+					binder_user_error("%d:%d BC_INCREFS_DONE node %d has no pending increfs request\n",
+						proc->pid, thread->pid,
 						node->debug_id);
 					binder_node_inner_unlock(node);
 					binder_put_node(node);
@@ -4103,8 +4096,8 @@ static int binder_thread_write(struct binder_proc *proc,
 					cmd == BC_ACQUIRE_DONE, 0);
 			WARN_ON(free_node);
 			binder_debug(BINDER_DEBUG_USER_REFS,
-				     "%d:%d(%s:%s) %s node %d ls %d lw %d tr %d\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				     "%d:%d %s node %d ls %d lw %d tr %d\n",
+				     proc->pid, thread->pid,
 				     cmd == BC_INCREFS_DONE ? "BC_INCREFS_DONE" : "BC_ACQUIRE_DONE",
 				     node->debug_id, node->local_strong_refs,
 				     node->local_weak_refs, node->tmp_refs);
@@ -4132,20 +4125,20 @@ static int binder_thread_write(struct binder_proc *proc,
 			if (IS_ERR_OR_NULL(buffer)) {
 				if (PTR_ERR(buffer) == -EPERM) {
 					binder_user_error(
-						"%d:%d(%s:%s) BC_FREE_BUFFER u%016llx matched unreturned or currently freeing buffer\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+						"%d:%d BC_FREE_BUFFER u%016llx matched unreturned or currently freeing buffer\n",
+						proc->pid, thread->pid,
 						(u64)data_ptr);
 				} else {
 					binder_user_error(
-						"%d:%d(%s:%s) BC_FREE_BUFFER u%016llx no match\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+						"%d:%d BC_FREE_BUFFER u%016llx no match\n",
+						proc->pid, thread->pid,
 						(u64)data_ptr);
 				}
 				break;
 			}
 			binder_debug(BINDER_DEBUG_FREE_BUFFER,
-				     "%d:%d(%s:%s) BC_FREE_BUFFER u%016llx found buffer %d for %s transaction\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)data_ptr,
+				     "%d:%d BC_FREE_BUFFER u%016llx found buffer %d for %s transaction\n",
+				     proc->pid, thread->pid, (u64)data_ptr,
 				     buffer->debug_id,
 				     buffer->transaction ? "active" : "finished");
 
@@ -4205,17 +4198,17 @@ static int binder_thread_write(struct binder_proc *proc,
 
 		case BC_REGISTER_LOOPER:
 			binder_debug(BINDER_DEBUG_THREADS,
-				     "%d:%d(%s:%s) BC_REGISTER_LOOPER\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				     "%d:%d BC_REGISTER_LOOPER\n",
+				     proc->pid, thread->pid);
 			binder_inner_proc_lock(proc);
 			if (thread->looper & BINDER_LOOPER_STATE_ENTERED) {
 				thread->looper |= BINDER_LOOPER_STATE_INVALID;
-				binder_user_error("%d:%d(%s:%s) ERROR: BC_REGISTER_LOOPER called after BC_ENTER_LOOPER\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d ERROR: BC_REGISTER_LOOPER called after BC_ENTER_LOOPER\n",
+					proc->pid, thread->pid);
 			} else if (proc->requested_threads == 0) {
 				thread->looper |= BINDER_LOOPER_STATE_INVALID;
-				binder_user_error("%d:%d(%s:%s) ERROR: BC_REGISTER_LOOPER called without request\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d ERROR: BC_REGISTER_LOOPER called without request\n",
+					proc->pid, thread->pid);
 			} else {
 				proc->requested_threads--;
 				proc->requested_threads_started++;
@@ -4225,19 +4218,19 @@ static int binder_thread_write(struct binder_proc *proc,
 			break;
 		case BC_ENTER_LOOPER:
 			binder_debug(BINDER_DEBUG_THREADS,
-				     "%d:%d(%s:%s) BC_ENTER_LOOPER\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				     "%d:%d BC_ENTER_LOOPER\n",
+				     proc->pid, thread->pid);
 			if (thread->looper & BINDER_LOOPER_STATE_REGISTERED) {
 				thread->looper |= BINDER_LOOPER_STATE_INVALID;
-				binder_user_error("%d:%d(%s:%s) ERROR: BC_ENTER_LOOPER called after BC_REGISTER_LOOPER\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				binder_user_error("%d:%d ERROR: BC_ENTER_LOOPER called after BC_REGISTER_LOOPER\n",
+					proc->pid, thread->pid);
 			}
 			thread->looper |= BINDER_LOOPER_STATE_ENTERED;
 			break;
 		case BC_EXIT_LOOPER:
 			binder_debug(BINDER_DEBUG_THREADS,
-				     "%d:%d(%s:%s) BC_EXIT_LOOPER\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				     "%d:%d BC_EXIT_LOOPER\n",
+				     proc->pid, thread->pid);
 			thread->looper |= BINDER_LOOPER_STATE_EXITED;
 			break;
 
@@ -4269,16 +4262,16 @@ static int binder_thread_write(struct binder_proc *proc,
 						&thread->return_error.work);
 					binder_debug(
 						BINDER_DEBUG_FAILED_TRANSACTION,
-						"%d:%d(%s:%s) BC_REQUEST_DEATH_NOTIFICATION failed\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+						"%d:%d BC_REQUEST_DEATH_NOTIFICATION failed\n",
+						proc->pid, thread->pid);
 					break;
 				}
 			}
 			binder_proc_lock(proc);
 			ref = binder_get_ref_olocked(proc, target, false);
 			if (ref == NULL) {
-				binder_user_error("%d:%d(%s:%s) %s invalid ref %d\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				binder_user_error("%d:%d %s invalid ref %d\n",
+					proc->pid, thread->pid,
 					cmd == BC_REQUEST_DEATH_NOTIFICATION ?
 					"BC_REQUEST_DEATH_NOTIFICATION" :
 					"BC_CLEAR_DEATH_NOTIFICATION",
@@ -4289,8 +4282,8 @@ static int binder_thread_write(struct binder_proc *proc,
 			}
 
 			binder_debug(BINDER_DEBUG_DEATH_NOTIFICATION,
-				     "%d:%d(%s:%s) %s %016llx ref %d desc %d s %d w %d for node %d\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				     "%d:%d %s %016llx ref %d desc %d s %d w %d for node %d\n",
+				     proc->pid, thread->pid,
 				     cmd == BC_REQUEST_DEATH_NOTIFICATION ?
 				     "BC_REQUEST_DEATH_NOTIFICATION" :
 				     "BC_CLEAR_DEATH_NOTIFICATION",
@@ -4301,8 +4294,8 @@ static int binder_thread_write(struct binder_proc *proc,
 			binder_node_lock(ref->node);
 			if (cmd == BC_REQUEST_DEATH_NOTIFICATION) {
 				if (ref->death) {
-					binder_user_error("%d:%d(%s:%s) BC_REQUEST_DEATH_NOTIFICATION death notification already set\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+					binder_user_error("%d:%d BC_REQUEST_DEATH_NOTIFICATION death notification already set\n",
+						proc->pid, thread->pid);
 					binder_node_unlock(ref->node);
 					binder_proc_unlock(proc);
 					kfree(death);
@@ -4323,16 +4316,16 @@ static int binder_thread_write(struct binder_proc *proc,
 				}
 			} else {
 				if (ref->death == NULL) {
-					binder_user_error("%d:%d(%s:%s) BC_CLEAR_DEATH_NOTIFICATION death notification not active\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+					binder_user_error("%d:%d BC_CLEAR_DEATH_NOTIFICATION death notification not active\n",
+						proc->pid, thread->pid);
 					binder_node_unlock(ref->node);
 					binder_proc_unlock(proc);
 					break;
 				}
 				death = ref->death;
 				if (death->cookie != cookie) {
-					binder_user_error("%d:%d(%s:%s) BC_CLEAR_DEATH_NOTIFICATION death notification cookie mismatch %016llx != %016llx\n",
-						proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+					binder_user_error("%d:%d BC_CLEAR_DEATH_NOTIFICATION death notification cookie mismatch %016llx != %016llx\n",
+						proc->pid, thread->pid,
 						(u64)death->cookie,
 						(u64)cookie);
 					binder_node_unlock(ref->node);
@@ -4388,12 +4381,12 @@ static int binder_thread_write(struct binder_proc *proc,
 				}
 			}
 			binder_debug(BINDER_DEBUG_DEAD_BINDER,
-				     "%d:%d(%s:%s) BC_DEAD_BINDER_DONE %016llx found %pK\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)cookie,
+				     "%d:%d BC_DEAD_BINDER_DONE %016llx found %pK\n",
+				     proc->pid, thread->pid, (u64)cookie,
 				     death);
 			if (death == NULL) {
-				binder_user_error("%d:%d(%s:%s) BC_DEAD_BINDER_DONE %016llx not found\n",
-					proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, (u64)cookie);
+				binder_user_error("%d:%d BC_DEAD_BINDER_DONE %016llx not found\n",
+					proc->pid, thread->pid, (u64)cookie);
 				binder_inner_proc_unlock(proc);
 				break;
 			}
@@ -4416,8 +4409,8 @@ static int binder_thread_write(struct binder_proc *proc,
 		} break;
 
 		default:
-			pr_err("%d:%d(%s:%s) unknown command %d\n",
-			       proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, cmd);
+			pr_err("%d:%d unknown command %d\n",
+			       proc->pid, thread->pid, cmd);
 			return -EINVAL;
 		}
 		*consumed = ptr - buffer;
@@ -4459,9 +4452,8 @@ static int binder_put_node_cmd(struct binder_proc *proc,
 	ptr += sizeof(binder_uintptr_t);
 
 	binder_stat_br(proc, thread, cmd);
-	binder_debug(BINDER_DEBUG_USER_REFS, "%d:%d(%s:%s) %s %d u%016llx c%016llx\n",
-		     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
-		     cmd_name, node_debug_id,
+	binder_debug(BINDER_DEBUG_USER_REFS, "%d:%d %s %d u%016llx c%016llx\n",
+		     proc->pid, thread->pid, cmd_name, node_debug_id,
 		     (u64)node_ptr, (u64)node_cookie);
 
 	*ptrp = ptr;
@@ -4489,7 +4481,7 @@ static int binder_wait_for_work(struct binder_thread *thread,
 		binder_inner_proc_lock(proc);
 		list_del_init(&thread->waiting_thread_node);
 		if (signal_pending(current)) {
-			ret = -EINTR;
+			ret = -ERESTARTSYS;
 			break;
 		}
 	}
@@ -4531,8 +4523,8 @@ retry:
 	if (wait_for_proc_work) {
 		if (!(thread->looper & (BINDER_LOOPER_STATE_REGISTERED |
 					BINDER_LOOPER_STATE_ENTERED))) {
-			binder_user_error("%d:%d(%s:%s) ERROR: Thread waiting for process work before calling BC_REGISTER_LOOPER or BC_ENTER_LOOPER (state %x)\n",
-				proc->pid, thread->pid, proc->tsk->comm, thread->task->comm, thread->looper);
+			binder_user_error("%d:%d ERROR: Thread waiting for process work before calling BC_REGISTER_LOOPER or BC_ENTER_LOOPER (state %x)\n",
+				proc->pid, thread->pid, thread->looper);
 			wait_event_interruptible(binder_user_error_wait,
 						 binder_stop_on_user_error < 2);
 		}
@@ -4564,9 +4556,15 @@ retry:
 		binder_inner_proc_lock(proc);
 		if (!binder_worklist_empty_ilocked(&thread->todo))
 			list = &thread->todo;
+#ifdef CONFIG_FAST_TRACK
+		else if (!binder_proc_worklist_empty_ilocked(proc) &&
+			   wait_for_proc_work)
+			list = binder_proc_select_worklist_ilocked(proc);
+#else
 		else if (!binder_worklist_empty_ilocked(&proc->todo) &&
 			   wait_for_proc_work)
 			list = &proc->todo;
+#endif
 		else {
 			binder_inner_proc_unlock(proc);
 
@@ -4603,14 +4601,9 @@ retry:
 
 			binder_stat_br(proc, thread, cmd);
 		} break;
-		case BINDER_WORK_TRANSACTION_COMPLETE:
-		case BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT: {
-			if (proc->oneway_spam_detection_enabled &&
-				   w->type == BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT)
-				cmd = BR_ONEWAY_SPAM_SUSPECT;
-			else
-				cmd = BR_TRANSACTION_COMPLETE;
+		case BINDER_WORK_TRANSACTION_COMPLETE: {
 			binder_inner_proc_unlock(proc);
+			cmd = BR_TRANSACTION_COMPLETE;
 			kfree(w);
 			binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
 			if (put_user(cmd, (uint32_t __user *)ptr))
@@ -4619,8 +4612,8 @@ retry:
 
 			binder_stat_br(proc, thread, cmd);
 			binder_debug(BINDER_DEBUG_TRANSACTION_COMPLETE,
-				     "%d:%d(%s:%s) BR_TRANSACTION_COMPLETE\n",
-				     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+				     "%d:%d BR_TRANSACTION_COMPLETE\n",
+				     proc->pid, thread->pid);
 		} break;
 		case BINDER_WORK_NODE: {
 			struct binder_node *node = container_of(w, struct binder_node, work);
@@ -4657,8 +4650,8 @@ retry:
 				node->has_weak_ref = 0;
 			if (!weak && !strong) {
 				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
-					     "%d:%d(%s:%s) node %d u%016llx c%016llx deleted\n",
-					     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+					     "%d:%d node %d u%016llx c%016llx deleted\n",
+					     proc->pid, thread->pid,
 					     node_debug_id,
 					     (u64)node_ptr,
 					     (u64)node_cookie);
@@ -4701,8 +4694,8 @@ retry:
 						BR_DECREFS, "BR_DECREFS");
 			if (orig_ptr == ptr)
 				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
-					     "%d:%d(%s:%s) node %d u%016llx c%016llx state unchanged\n",
-					     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+					     "%d:%d node %d u%016llx c%016llx state unchanged\n",
+					     proc->pid, thread->pid,
 					     node_debug_id,
 					     (u64)node_ptr,
 					     (u64)node_cookie);
@@ -4724,8 +4717,8 @@ retry:
 			cookie = death->cookie;
 
 			binder_debug(BINDER_DEBUG_DEATH_NOTIFICATION,
-				     "%d:%d(%s:%s) %s %016llx\n",
-				      proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+				     "%d:%d %s %016llx\n",
+				      proc->pid, thread->pid,
 				      cmd == BR_DEAD_BINDER ?
 				      "BR_DEAD_BINDER" :
 				      "BR_CLEAR_DEATH_NOTIFICATION_DONE",
@@ -4783,6 +4776,9 @@ retry:
 			trd->sender_pid =
 				task_tgid_nr_ns(sender,
 						task_active_pid_ns(current));
+#ifdef CONFIG_FAST_TRACK
+			ftt_binder_enqueue(thread, t_from);
+#endif
 		} else {
 			trd->sender_pid = 0;
 		}
@@ -4820,22 +4816,20 @@ retry:
 		}
 		ptr += trsize;
 
-#ifdef CONFIG_DEBUG_SNAPSHOT_BINDER
-		dss_binder_transaction_received(t, thread);
-#endif
 		trace_binder_transaction_received(t);
+#ifdef CONFIG_SCHED_WALT
+		if (current->low_latency)
+			current->low_latency = false;
+#endif
 		binder_stat_br(proc, thread, cmd);
 		binder_debug(BINDER_DEBUG_TRANSACTION,
-			     "%d:%d(%s:%s) %s %d %d:%d(%s:%s), cmd %d size %zd-%zd ptr %016llx-%016llx\n",
-			     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+			     "%d:%d %s %d %d:%d, cmd %d size %zd-%zd ptr %016llx-%016llx\n",
+			     proc->pid, thread->pid,
 			     (cmd == BR_TRANSACTION) ? "BR_TRANSACTION" :
 				(cmd == BR_TRANSACTION_SEC_CTX) ?
 				     "BR_TRANSACTION_SEC_CTX" : "BR_REPLY",
 			     t->debug_id, t_from ? t_from->proc->pid : 0,
-			     t_from ? t_from->pid : 0,
-			     t_from ? t_from->proc->tsk->comm : "",
-			     t_from ? t_from->task->comm : "",
-			     cmd,
+			     t_from ? t_from->pid : 0, cmd,
 			     t->buffer->data_size, t->buffer->offsets_size,
 			     (u64)trd->data.ptr.buffer,
 			     (u64)trd->data.ptr.offsets);
@@ -4868,8 +4862,8 @@ done:
 		proc->requested_threads++;
 		binder_inner_proc_unlock(proc);
 		binder_debug(BINDER_DEBUG_THREADS,
-			     "%d:%d(%s:%s) BR_SPAWN_LOOPER\n",
-			     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+			     "%d:%d BR_SPAWN_LOOPER\n",
+			     proc->pid, thread->pid);
 		if (put_user(BR_SPAWN_LOOPER, (uint32_t __user *)buffer))
 			return -EFAULT;
 		binder_stat_br(proc, thread, BR_SPAWN_LOOPER);
@@ -5004,7 +4998,6 @@ static void binder_free_proc(struct binder_proc *proc)
 
 	BUG_ON(!list_empty(&proc->todo));
 	BUG_ON(!list_empty(&proc->delivered_death));
-	WARN_ON(proc->outstanding_txns);
 	device = container_of(proc->context, struct binder_device, context);
 	if (refcount_dec_and_test(&device->ref)) {
 		kfree(proc->context->name);
@@ -5041,7 +5034,7 @@ static int binder_thread_release(struct binder_proc *proc,
 	 * The corresponding dec is when we actually
 	 * free the thread in binder_free_thread()
 	 */
-	atomic_inc(&proc->tmp_ref);
+	proc->tmp_ref++;
 	/*
 	 * take a ref on this thread to ensure it
 	 * survives while we are releasing it
@@ -5060,13 +5053,12 @@ static int binder_thread_release(struct binder_proc *proc,
 		last_t = t;
 		active_transactions++;
 		binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
-			     "release %d:%d(%s:%s) transaction %d %s, still active\n",
-			      proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+			     "release %d:%d transaction %d %s, still active\n",
+			      proc->pid, thread->pid,
 			     t->debug_id,
 			     (t->to_thread == thread) ? "in" : "out");
 
 		if (t->to_thread == thread) {
-			t->to_proc->outstanding_txns--;
 			t->to_proc = NULL;
 			t->to_thread = NULL;
 			if (t->buffer) {
@@ -5119,7 +5111,7 @@ static __poll_t binder_poll(struct file *filp,
 
 	thread = binder_get_thread(proc);
 	if (!thread)
-		return EPOLLERR;
+		return POLLERR;
 
 	binder_inner_proc_lock(thread->proc);
 	thread->looper |= BINDER_LOOPER_STATE_POLL;
@@ -5154,8 +5146,8 @@ static int binder_ioctl_write_read(struct file *filp,
 		goto out;
 	}
 	binder_debug(BINDER_DEBUG_READ_WRITE,
-		     "%d:%d(%s:%s) write %lld at %016llx, read %lld at %016llx\n",
-		     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+		     "%d:%d write %lld at %016llx, read %lld at %016llx\n",
+		     proc->pid, thread->pid,
 		     (u64)bwr.write_size, (u64)bwr.write_buffer,
 		     (u64)bwr.read_size, (u64)bwr.read_buffer);
 
@@ -5179,7 +5171,11 @@ static int binder_ioctl_write_read(struct file *filp,
 					 filp->f_flags & O_NONBLOCK);
 		trace_binder_read_done(ret);
 		binder_inner_proc_lock(proc);
+#ifdef CONFIG_FAST_TRACK
+		if (!binder_proc_worklist_empty_ilocked(proc))
+#else
 		if (!binder_worklist_empty_ilocked(&proc->todo))
+#endif
 			binder_wakeup_proc_ilocked(proc);
 		binder_inner_proc_unlock(proc);
 		if (ret < 0) {
@@ -5189,8 +5185,8 @@ static int binder_ioctl_write_read(struct file *filp,
 		}
 	}
 	binder_debug(BINDER_DEBUG_READ_WRITE,
-		     "%d:%d(%s:%s) wrote %lld of %lld, read return %lld of %lld\n",
-		     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm,
+		     "%d:%d wrote %lld of %lld, read return %lld of %lld\n",
+		     proc->pid, thread->pid,
 		     (u64)bwr.write_consumed, (u64)bwr.write_size,
 		     (u64)bwr.read_consumed, (u64)bwr.read_size);
 	if (copy_to_user(ubuf, &bwr, sizeof(bwr))) {
@@ -5310,100 +5306,6 @@ static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
 	return 0;
 }
 
-static bool binder_txns_pending_ilocked(struct binder_proc *proc)
-{
-	struct rb_node *n;
-	struct binder_thread *thread;
-
-	if (proc->outstanding_txns > 0)
-		return true;
-
-	for (n = rb_first(&proc->threads); n; n = rb_next(n)) {
-		thread = rb_entry(n, struct binder_thread, rb_node);
-		if (thread->transaction_stack)
-			return true;
-	}
-	return false;
-}
-
-static int binder_ioctl_freeze(struct binder_freeze_info *info,
-			       struct binder_proc *target_proc)
-{
-	int ret = 0;
-
-	if (!info->enable) {
-		binder_inner_proc_lock(target_proc);
-		target_proc->sync_recv = false;
-		target_proc->async_recv = false;
-		target_proc->is_frozen = false;
-		binder_inner_proc_unlock(target_proc);
-		return 0;
-	}
-
-	/*
-	 * Freezing the target. Prevent new transactions by
-	 * setting frozen state. If timeout specified, wait
-	 * for transactions to drain.
-	 */
-	binder_inner_proc_lock(target_proc);
-	target_proc->sync_recv = false;
-	target_proc->async_recv = false;
-	target_proc->is_frozen = true;
-	binder_inner_proc_unlock(target_proc);
-
-	if (info->timeout_ms > 0)
-		ret = wait_event_interruptible_timeout(
-			target_proc->freeze_wait,
-			(!target_proc->outstanding_txns),
-			msecs_to_jiffies(info->timeout_ms));
-
-	/* Check pending transactions that wait for reply */
-	if (ret >= 0) {
-		binder_inner_proc_lock(target_proc);
-		if (binder_txns_pending_ilocked(target_proc))
-			ret = -EAGAIN;
-		binder_inner_proc_unlock(target_proc);
-	}
-
-	if (ret < 0) {
-		binder_inner_proc_lock(target_proc);
-		target_proc->is_frozen = false;
-		binder_inner_proc_unlock(target_proc);
-	}
-
-	return ret;
-}
-
-static int binder_ioctl_get_freezer_info(
-				struct binder_frozen_status_info *info)
-{
-	struct binder_proc *target_proc;
-	bool found = false;
-	__u32 txns_pending;
-
-	info->sync_recv = 0;
-	info->async_recv = 0;
-
-	mutex_lock(&binder_procs_lock);
-	hlist_for_each_entry(target_proc, &binder_procs, proc_node) {
-		if (target_proc->pid == info->pid) {
-			found = true;
-			binder_inner_proc_lock(target_proc);
-			txns_pending = binder_txns_pending_ilocked(target_proc);
-			info->sync_recv |= target_proc->sync_recv |
-					(txns_pending << 1);
-			info->async_recv |= target_proc->async_recv;
-			binder_inner_proc_unlock(target_proc);
-		}
-	}
-	mutex_unlock(&binder_procs_lock);
-
-	if (!found)
-		return -EINVAL;
-
-	return 0;
-}
-
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret;
@@ -5466,8 +5368,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			goto err;
 		break;
 	case BINDER_THREAD_EXIT:
-		binder_debug(BINDER_DEBUG_THREADS, "%d:%d(%s:%s) exit\n",
-			     proc->pid, thread->pid, proc->tsk->comm, thread->task->comm);
+		binder_debug(BINDER_DEBUG_THREADS, "%d:%d exit\n",
+			     proc->pid, thread->pid);
 		binder_thread_release(proc, thread);
 		thread = NULL;
 		break;
@@ -5522,94 +5424,12 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	}
-	case BINDER_FREEZE: {
-		struct binder_freeze_info info;
-		struct binder_proc **target_procs = NULL, *target_proc;
-		int target_procs_count = 0, i = 0;
-
-		ret = 0;
-
-		if (copy_from_user(&info, ubuf, sizeof(info))) {
-			ret = -EFAULT;
-			goto err;
-		}
-
-		mutex_lock(&binder_procs_lock);
-		hlist_for_each_entry(target_proc, &binder_procs, proc_node) {
-			if (target_proc->pid == info.pid)
-				target_procs_count++;
-		}
-
-		if (target_procs_count == 0) {
-			mutex_unlock(&binder_procs_lock);
+	case BINDER_SET_SYSTEM_SERVER_PID: {
+		if (copy_from_user(&system_server_pid, ubuf,
+					sizeof(system_server_pid))) {
 			ret = -EINVAL;
 			goto err;
 		}
-
-		target_procs = kmalloc(sizeof(struct binder_proc *) *
-					       target_procs_count,
-				       GFP_KERNEL);
-
-		if (!target_procs) {
-			mutex_unlock(&binder_procs_lock);
-			ret = -ENOMEM;
-			goto err;
-		}
-
-		hlist_for_each_entry(target_proc, &binder_procs, proc_node) {
-			if (target_proc->pid != info.pid)
-				continue;
-
-			binder_inner_proc_lock(target_proc);
-			atomic_inc(&target_proc->tmp_ref);
-			binder_inner_proc_unlock(target_proc);
-
-			target_procs[i++] = target_proc;
-		}
-		mutex_unlock(&binder_procs_lock);
-
-		for (i = 0; i < target_procs_count; i++) {
-			if (ret >= 0)
-				ret = binder_ioctl_freeze(&info,
-							  target_procs[i]);
-
-			binder_proc_dec_tmpref(target_procs[i]);
-		}
-
-		kfree(target_procs);
-
-		if (ret < 0)
-			goto err;
-		break;
-	}
-	case BINDER_GET_FROZEN_INFO: {
-		struct binder_frozen_status_info info;
-
-		if (copy_from_user(&info, ubuf, sizeof(info))) {
-			ret = -EFAULT;
-			goto err;
-		}
-
-		ret = binder_ioctl_get_freezer_info(&info);
-		if (ret < 0)
-			goto err;
-
-		if (copy_to_user(ubuf, &info, sizeof(info))) {
-			ret = -EFAULT;
-			goto err;
-		}
-		break;
-	}
-	case BINDER_ENABLE_ONEWAY_SPAM_DETECTION: {
-		uint32_t enable;
-
-		if (copy_from_user(&enable, ubuf, sizeof(enable))) {
-			ret = -EFAULT;
-			goto err;
-		}
-		binder_inner_proc_lock(proc);
-		proc->oneway_spam_detection_enabled = (bool)enable;
-		binder_inner_proc_unlock(proc);
 		break;
 	}
 	default:
@@ -5621,9 +5441,8 @@ err:
 	if (thread)
 		thread->looper_need_return = false;
 	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
-	if (ret && ret != -EINTR)
-		pr_info("%d:%d(%s:%s) ioctl %x %lx returned %d\n", proc->pid, current->pid,
-			proc->tsk->comm, current->comm, cmd, arg, ret);
+	if (ret && ret != -ERESTARTSYS)
+		pr_info("%d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
 err_unlocked:
 	trace_binder_ioctl_done(ret);
 	if (ret == -ERESTARTSYS)
@@ -5636,8 +5455,8 @@ static void binder_vma_open(struct vm_area_struct *vma)
 	struct binder_proc *proc = vma->vm_private_data;
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
-		     "%d(%s) open vm area %lx-%lx (%ld K) vma %lx pagep %lx\n",
-		     proc->pid, proc->tsk->comm, vma->vm_start, vma->vm_end,
+		     "%d open vm area %lx-%lx (%ld K) vma %lx pagep %lx\n",
+		     proc->pid, vma->vm_start, vma->vm_end,
 		     (vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
 		     (unsigned long)pgprot_val(vma->vm_page_prot));
 }
@@ -5647,8 +5466,8 @@ static void binder_vma_close(struct vm_area_struct *vma)
 	struct binder_proc *proc = vma->vm_private_data;
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
-		     "%d(%s) close vm area %lx-%lx (%ld K) vma %lx pagep %lx\n",
-		     proc->pid, proc->tsk->comm, vma->vm_start, vma->vm_end,
+		     "%d close vm area %lx-%lx (%ld K) vma %lx pagep %lx\n",
+		     proc->pid, vma->vm_start, vma->vm_end,
 		     (vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
 		     (unsigned long)pgprot_val(vma->vm_page_prot));
 	binder_alloc_vma_close(&proc->alloc);
@@ -5679,8 +5498,8 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 		vma->vm_end = vma->vm_start + SZ_4M;
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
-		     "%s: %d(%s) %lx-%lx (%ld K) vma %lx pagep %lx\n",
-		     __func__, proc->pid, proc->tsk->comm, vma->vm_start, vma->vm_end,
+		     "%s: %d %lx-%lx (%ld K) vma %lx pagep %lx\n",
+		     __func__, proc->pid, vma->vm_start, vma->vm_end,
 		     (vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
 		     (unsigned long)pgprot_val(vma->vm_page_prot));
 
@@ -5704,8 +5523,8 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	return 0;
 
 err_bad_arg:
-	pr_err("%s: %d(%s) %lx-%lx %s failed %d\n", __func__,
-	       proc->pid, proc->tsk->comm, vma->vm_start, vma->vm_end, failure_string, ret);
+	pr_err("%s: %d %lx-%lx %s failed %d\n", __func__,
+	       proc->pid, vma->vm_start, vma->vm_end, failure_string, ret);
 	return ret;
 }
 
@@ -5716,22 +5535,24 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	struct binderfs_info *info;
 	struct dentry *binder_binderfs_dir_entry_proc = NULL;
 
-	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "%s: %d:%d(%s:%s)\n", __func__,
-		     current->group_leader->pid, current->pid,
-		     current->group_leader->comm, current->comm);
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "%s: %d:%d\n", __func__,
+		     current->group_leader->pid, current->pid);
 
 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
 	if (proc == NULL)
 		return -ENOMEM;
 	spin_lock_init(&proc->inner_lock);
 	spin_lock_init(&proc->outer_lock);
-	atomic_set(&proc->tmp_ref, 0);
 	get_task_struct(current->group_leader);
 	proc->tsk = current->group_leader;
 	mutex_init(&proc->files_lock);
 	proc->cred = get_cred(filp->f_cred);
 	INIT_LIST_HEAD(&proc->todo);
-	init_waitqueue_head(&proc->freeze_wait);
+#ifdef CONFIG_FAST_TRACK
+	INIT_LIST_HEAD(&proc->fg_todo);
+	proc->fg_count = 0;
+#endif
+
 	if (binder_supported_policy(current->policy)) {
 		proc->default_priority.sched_policy = current->policy;
 		proc->default_priority.prio = current->normal_prio;
@@ -5839,7 +5660,7 @@ static void binder_deferred_flush(struct binder_proc *proc)
 	binder_inner_proc_unlock(proc);
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
-		     "binder_flush: %d(%s) woke %d threads\n", proc->pid, proc->tsk->comm,
+		     "binder_flush: %d woke %d threads\n", proc->pid,
 		     wake_count);
 }
 
@@ -5940,8 +5761,8 @@ static void binder_deferred_release(struct binder_proc *proc)
 	if (context->binder_context_mgr_node &&
 	    context->binder_context_mgr_node->proc == proc) {
 		binder_debug(BINDER_DEBUG_DEAD_BINDER,
-			     "%s: %d(%s) context_mgr_node gone\n",
-			     __func__, proc->pid, proc->tsk->comm);
+			     "%s: %d context_mgr_node gone\n",
+			     __func__, proc->pid);
 		context->binder_context_mgr_node = NULL;
 	}
 	mutex_unlock(&context->context_mgr_node_lock);
@@ -5950,12 +5771,9 @@ static void binder_deferred_release(struct binder_proc *proc)
 	 * Make sure proc stays alive after we
 	 * remove all the threads
 	 */
-	atomic_inc(&proc->tmp_ref);
+	proc->tmp_ref++;
 
 	proc->is_dead = true;
-	proc->is_frozen = false;
-	proc->sync_recv = false;
-	proc->async_recv = false;
 	threads = 0;
 	active_transactions = 0;
 	while ((n = rb_first(&proc->threads))) {
@@ -6003,11 +5821,14 @@ static void binder_deferred_release(struct binder_proc *proc)
 	binder_proc_unlock(proc);
 
 	binder_release_work(proc, &proc->todo);
+#ifdef CONFIG_FAST_TRACK
+	binder_release_work(proc, &proc->fg_todo);
+#endif
 	binder_release_work(proc, &proc->delivered_death);
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
-		     "%s: %d(%s) threads %d, nodes %d (ref %d), refs %d, active transactions %d\n",
-		     __func__, proc->pid, proc->tsk->comm, threads, nodes, incoming_refs,
+		     "%s: %d threads %d, nodes %d (ref %d), refs %d, active transactions %d\n",
+		     __func__, proc->pid, threads, nodes, incoming_refs,
 		     outgoing_refs, active_transactions);
 
 	binder_proc_dec_tmpref(proc);
@@ -6079,16 +5900,12 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 	spin_lock(&t->lock);
 	to_proc = t->to_proc;
 	seq_printf(m,
-		   "%s %d: %pK from %d:%d(%s:%s) to %d:%d(%s:%s) code %x flags %x pri %d:%d r%d",
+		   "%s %d: %pK from %d:%d to %d:%d code %x flags %x pri %d:%d r%d",
 		   prefix, t->debug_id, t,
 		   t->from ? t->from->proc->pid : 0,
 		   t->from ? t->from->pid : 0,
-		   t->from ? t->from->proc->tsk->comm : "",
-		   t->from ? t->from->task->comm : "",
 		   to_proc ? to_proc->pid : 0,
 		   t->to_thread ? t->to_thread->pid : 0,
-		   to_proc ? to_proc->tsk->comm : "",
-		   t->to_thread ? t->to_thread->task->comm : "",
 		   t->code, t->flags, t->priority.sched_policy,
 		   t->priority.prio, t->need_reply);
 	spin_unlock(&t->lock);
@@ -6168,8 +5985,8 @@ static void print_binder_thread_ilocked(struct seq_file *m,
 	size_t start_pos = m->count;
 	size_t header_pos;
 
-	seq_printf(m, "  thread %d %s: l %02x need_return %d tr %d\n",
-			thread->pid, thread->task->comm, thread->looper,
+	seq_printf(m, "  thread %d: l %02x need_return %d tr %d\n",
+			thread->pid, thread->looper,
 			thread->looper_need_return,
 			atomic_read(&thread->tmp_ref));
 	header_pos = m->count;
@@ -6217,7 +6034,7 @@ static void print_binder_node_nilocked(struct seq_file *m,
 	if (count) {
 		seq_puts(m, " proc");
 		hlist_for_each_entry(ref, &node->refs, node_entry)
-			seq_printf(m, " %d %s", ref->proc->pid, ref->proc->tsk->comm);
+			seq_printf(m, " %d", ref->proc->pid);
 	}
 	seq_puts(m, "\n");
 	if (node->proc) {
@@ -6248,7 +6065,7 @@ static void print_binder_proc(struct seq_file *m,
 	size_t header_pos;
 	struct binder_node *last_node = NULL;
 
-	seq_printf(m, "proc %d %s\n", proc->pid, proc->tsk->comm);
+	seq_printf(m, "proc %d\n", proc->pid);
 	seq_printf(m, "context %s\n", proc->context->name);
 	header_pos = m->count;
 
@@ -6298,6 +6115,11 @@ static void print_binder_proc(struct seq_file *m,
 	list_for_each_entry(w, &proc->todo, entry)
 		print_binder_work_ilocked(m, proc, "  ",
 					  "  pending transaction", w);
+#ifdef CONFIG_FAST_TRACK
+	list_for_each_entry(w, &proc->fg_todo, entry)
+		print_binder_work_ilocked(m, proc, "  ",
+					  "  pending foreground transaction", w);
+#endif
 	list_for_each_entry(w, &proc->delivered_death, entry) {
 		seq_puts(m, "  has delivered dead binder\n");
 		break;
@@ -6356,6 +6178,42 @@ static void binder_in_transaction(struct binder_proc *proc, int uid)
 	}
 
 	//check binder proc todo list
+#ifdef CONFIG_FAST_TRACK
+        empty = binder_proc_worklist_empty_ilocked(proc);
+	if (!empty) {
+		list_for_each_entry(w, &proc->todo, entry) {
+			if (w->type == BINDER_WORK_TRANSACTION) {
+				t = container_of(w, struct binder_transaction, work);
+				if (!(t->flags & TF_ONE_WAY)) {
+					found = true;
+					break;
+				}
+			}
+			else if (w->type != BINDER_WORK_TRANSACTION_COMPLETE && w->type != BINDER_WORK_NODE) {
+				found = true;
+				break;
+			}
+		}
+		list_for_each_entry(w, &proc->fg_todo, entry) {
+			if (w->type == BINDER_WORK_TRANSACTION) {
+				t = container_of(w, struct binder_transaction, work);
+				if (!(t->flags & TF_ONE_WAY)) {
+					found = true;
+					break;
+				}
+			}
+			else if (w->type != BINDER_WORK_TRANSACTION_COMPLETE && w->type != BINDER_WORK_NODE) {
+				found = true;
+				break;
+			}
+		}
+		if (found == true) {
+			binder_inner_proc_unlock(proc);
+			cfb_report(uid, "proc");
+			return;
+		}
+	}
+#else
 	empty = binder_worklist_empty_ilocked(&proc->todo);
 	if (!empty) {
 		list_for_each_entry(w, &proc->todo, entry) {
@@ -6378,6 +6236,7 @@ static void binder_in_transaction(struct binder_proc *proc, int uid)
 			return;
 		}
 	}
+#endif
 	binder_inner_proc_unlock(proc);
 }
 
@@ -6413,9 +6272,7 @@ static const char * const binder_return_strings[] = {
 	"BR_FINISHED",
 	"BR_DEAD_BINDER",
 	"BR_CLEAR_DEATH_NOTIFICATION_DONE",
-	"BR_FAILED_REPLY",
-	"BR_FROZEN_REPLY",
-	"BR_ONEWAY_SPAM_SUSPECT",
+	"BR_FAILED_REPLY"
 };
 
 static const char * const binder_command_strings[] = {
@@ -6502,7 +6359,7 @@ static void print_binder_proc_stats(struct seq_file *m,
 	size_t free_async_space =
 		binder_alloc_get_free_async_space(&proc->alloc);
 
-	seq_printf(m, "proc %d %s\n", proc->pid, proc->tsk->comm);
+	seq_printf(m, "proc %d\n", proc->pid);
 	seq_printf(m, "context %s\n", proc->context->name);
 	count = 0;
 	ready_threads = 0;
@@ -6553,6 +6410,16 @@ static void print_binder_proc_stats(struct seq_file *m,
 	binder_inner_proc_unlock(proc);
 	seq_printf(m, "  pending transactions: %d\n", count);
 
+#ifdef CONFIG_FAST_TRACK
+	count = 0;
+	binder_inner_proc_lock(proc);
+	list_for_each_entry(w, &proc->fg_todo, entry) {
+		if (w->type == BINDER_WORK_TRANSACTION)
+			count++;
+	}
+	binder_inner_proc_unlock(proc);
+	seq_printf(m, "  pending foreground transactions: %d\n", count);
+#endif
 	print_binder_stats(m, "  ", &proc->stats);
 }
 
@@ -6775,6 +6642,13 @@ static int __init binder_init(void)
 				    binder_debugfs_dir_entry_root,
 				    &binder_transaction_log_failed,
 				    &binder_transaction_log_fops);
+#ifdef CONFIG_FAST_TRACK
+		debugfs_create_file("switch",
+				    S_IRUGO,
+				    binder_debugfs_dir_entry_root,
+				    NULL,
+				    &binder_switch_fops);
+#endif
 	}
 
 	if (!IS_ENABLED(CONFIG_ANDROID_BINDERFS) &&
@@ -6814,7 +6688,6 @@ err_init_binder_device_failed:
 
 err_alloc_device_names_failed:
 	debugfs_remove_recursive(binder_debugfs_dir_entry_root);
-	binder_alloc_shrinker_exit();
 
 	return ret;
 }

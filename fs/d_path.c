@@ -46,7 +46,12 @@ static int prepend_name(char **buffer, int *buflen, const struct qstr *name)
 		return -ENAMETOOLONG;
 	p = *buffer -= dlen + 1;
 	*p++ = '/';
-	memcpy(p, dname, dlen);
+	while (dlen--) {
+		char c = *dname++;
+		if (!c)
+			break;
+		*p++ = c;
+	}
 	return 0;
 }
 
@@ -108,7 +113,11 @@ restart:
 			if (mnt != parent) {
 				dentry = READ_ONCE(mnt->mnt_mountpoint);
 				mnt = parent;
+#ifdef CONFIG_KDP_NS
+				vfsmnt = mnt->mnt;
+#else
 				vfsmnt = &mnt->mnt;
+#endif
 				continue;
 			}
 			if (!error)
@@ -199,6 +208,7 @@ char *d_absolute_path(const struct path *path,
 		return ERR_PTR(error);
 	return res;
 }
+EXPORT_SYMBOL(d_absolute_path);
 
 /*
  * same as __d_path but appends "(deleted)" for unlinked files.
@@ -248,9 +258,9 @@ static void get_fs_root_rcu(struct fs_struct *fs, struct path *root)
  *
  * "buflen" should be positive.
  */
-char *d_path_outlen(const struct path *path, char *buf, int *buflen)
+char *d_path(const struct path *path, char *buf, int buflen)
 {
-	char *res = buf + *buflen;
+	char *res = buf + buflen;
 	struct path root;
 	int error;
 
@@ -267,21 +277,16 @@ char *d_path_outlen(const struct path *path, char *buf, int *buflen)
 	 */
 	if (path->dentry->d_op && path->dentry->d_op->d_dname &&
 	    (!IS_ROOT(path->dentry) || path->dentry != path->mnt->mnt_root))
-		return path->dentry->d_op->d_dname(path->dentry, buf, *buflen);
+		return path->dentry->d_op->d_dname(path->dentry, buf, buflen);
 
 	rcu_read_lock();
 	get_fs_root_rcu(current->fs, &root);
-	error = path_with_deleted(path, &root, &res, buflen);
+	error = path_with_deleted(path, &root, &res, &buflen);
 	rcu_read_unlock();
 
 	if (error < 0)
 		res = ERR_PTR(error);
 	return res;
-}
-
-char *d_path(const struct path *path, char *buf, int buflen)
-{
-	return d_path_outlen(path, buf, &buflen);
 }
 EXPORT_SYMBOL(d_path);
 

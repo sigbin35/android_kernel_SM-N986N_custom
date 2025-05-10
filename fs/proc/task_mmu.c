@@ -20,16 +20,13 @@
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
 #include <linux/mm_inline.h>
+#include <linux/freezer.h>
 #include <linux/ctype.h>
 
 #include <asm/elf.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
-
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs.h>
-#endif
 
 #ifdef CONFIG_ZRAM_LRU_WRITEBACK
 #include <linux/delay.h>
@@ -171,7 +168,7 @@ static void seq_print_vma_name(struct seq_file *m, struct vm_area_struct *vma)
 	page_offset = (unsigned long)name - page_start_vaddr;
 	num_pages = DIV_ROUND_UP(page_offset + max_len, PAGE_SIZE);
 
-	seq_write(m, "[anon:", 6);
+	seq_puts(m, "[anon:");
 
 	for (i = 0; i < num_pages; i++) {
 		int len;
@@ -183,7 +180,7 @@ static void seq_print_vma_name(struct seq_file *m, struct vm_area_struct *vma)
 		pages_pinned = get_user_pages_remote(current, mm,
 				page_start_vaddr, 1, 0, &page, NULL, NULL);
 		if (pages_pinned < 1) {
-			seq_write(m, "<fault>]\n", 9);
+			seq_puts(m, "<fault>]");
 			return;
 		}
 
@@ -203,7 +200,7 @@ static void seq_print_vma_name(struct seq_file *m, struct vm_area_struct *vma)
 		page_start_vaddr += PAGE_SIZE;
 	}
 
-	seq_write(m, "]\n", 2);
+	seq_putc(m, ']');
 }
 
 static void vma_stop(struct proc_maps_private *priv)
@@ -359,117 +356,24 @@ static int is_stack(struct vm_area_struct *vma)
 		vma->vm_end >= vma->vm_mm->start_stack;
 }
 
-#define print_vma_hex10(out, val, clz_fn) \
-({									\
-	const typeof(val) __val = val;					\
-	char *const __out = out;					\
-	size_t __len;							\
-									\
-	if (__val) {							\
-		__len = (sizeof(__val) * 8 - clz_fn(__val) + 3) / 4;	\
-		switch (__len) {					\
-		case 10:						\
-			__out[9] = hex_asc[(__val >>  0) & 0xf];	\
-			__out[8] = hex_asc[(__val >>  4) & 0xf];	\
-			__out[7] = hex_asc[(__val >>  8) & 0xf];	\
-			__out[6] = hex_asc[(__val >> 12) & 0xf];	\
-			__out[5] = hex_asc[(__val >> 16) & 0xf];	\
-			__out[4] = hex_asc[(__val >> 20) & 0xf];	\
-			__out[3] = hex_asc[(__val >> 24) & 0xf];	\
-			__out[2] = hex_asc[(__val >> 28) & 0xf];	\
-			__out[1] = hex_asc[(__val >> 32) & 0xf];	\
-			__out[0] = hex_asc[(__val >> 36) & 0xf];	\
-			break;						\
-		case 9:							\
-			__out[8] = hex_asc[(__val >>  0) & 0xf];	\
-			__out[7] = hex_asc[(__val >>  4) & 0xf];	\
-			__out[6] = hex_asc[(__val >>  8) & 0xf];	\
-			__out[5] = hex_asc[(__val >> 12) & 0xf];	\
-			__out[4] = hex_asc[(__val >> 16) & 0xf];	\
-			__out[3] = hex_asc[(__val >> 20) & 0xf];	\
-			__out[2] = hex_asc[(__val >> 24) & 0xf];	\
-			__out[1] = hex_asc[(__val >> 28) & 0xf];	\
-			__out[0] = hex_asc[(__val >> 32) & 0xf];	\
-			break;						\
-		default:						\
-			__out[7] = hex_asc[(__val >>  0) & 0xf];	\
-			__out[6] = hex_asc[(__val >>  4) & 0xf];	\
-			__out[5] = hex_asc[(__val >>  8) & 0xf];	\
-			__out[4] = hex_asc[(__val >> 12) & 0xf];	\
-			__out[3] = hex_asc[(__val >> 16) & 0xf];	\
-			__out[2] = hex_asc[(__val >> 20) & 0xf];	\
-			__out[1] = hex_asc[(__val >> 24) & 0xf];	\
-			__out[0] = hex_asc[(__val >> 28) & 0xf];	\
-			__len = 8;					\
-			break;						\
-		}							\
-	} else {							\
-		*(u64 *)__out = U64_C(0x3030303030303030);		\
-		__len = 8;						\
-	}								\
-									\
-	__len;								\
-})
-
-#define print_vma_hex2(out, val) \
-({									\
-	const typeof(val) __val = val;					\
-	char *const __out = out;					\
-									\
-	__out[1] = hex_asc[(__val >>  0) & 0xf];			\
-	__out[0] = hex_asc[(__val >>  4) & 0xf];			\
-									\
-	2;								\
-})
-
-static int show_vma_header_prefix(struct seq_file *m, unsigned long start,
-				  unsigned long end, vm_flags_t flags,
-				  unsigned long long pgoff, dev_t dev,
-				  unsigned long ino)
+static void show_vma_header_prefix(struct seq_file *m,
+				   unsigned long start, unsigned long end,
+				   vm_flags_t flags, unsigned long long pgoff,
+				   dev_t dev, unsigned long ino)
 {
-	size_t len;
-	char *out;
-
-	/* Set the overflow status to get more memory if there's no space */
-	if (seq_get_buf(m, &out) < 65) {
-		seq_commit(m, -1);
-		return -ENOMEM;
-	}
-
-	/* Supports printing up to 40 bits per virtual address */
-	BUILD_BUG_ON(CONFIG_ARM64_VA_BITS > 40);
-
-	len = print_vma_hex10(out, start, __builtin_clzl);
-
-	out[len++] = '-';
-
-	len += print_vma_hex10(out + len, end, __builtin_clzl);
-
-	out[len++] = ' ';
-	out[len++] = "-r"[!!(flags & VM_READ)];
-	out[len++] = "-w"[!!(flags & VM_WRITE)];
-	out[len++] = "-x"[!!(flags & VM_EXEC)];
-	out[len++] = "ps"[!!(flags & VM_MAYSHARE)];
-	out[len++] = ' ';
-
-	len += print_vma_hex10(out + len, pgoff, __builtin_clzll);
-
-	out[len++] = ' ';
-
-	len += print_vma_hex2(out + len, MAJOR(dev));
-
-	out[len++] = ':';
-
-	len += print_vma_hex2(out + len, MINOR(dev));
-
-	out[len++] = ' ';
-
-	len += num_to_str(&out[len], 20, ino, 0);
-
-	out[len++] = ' ';
-
-	m->count += len;
-	return 0;
+	seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
+	seq_put_hex_ll(m, NULL, start, 8);
+	seq_put_hex_ll(m, "-", end, 8);
+	seq_putc(m, ' ');
+	seq_putc(m, flags & VM_READ ? 'r' : '-');
+	seq_putc(m, flags & VM_WRITE ? 'w' : '-');
+	seq_putc(m, flags & VM_EXEC ? 'x' : '-');
+	seq_putc(m, flags & VM_MAYSHARE ? 's' : 'p');
+	seq_put_hex_ll(m, " ", pgoff, 8);
+	seq_put_hex_ll(m, " ", MAJOR(dev), 2);
+	seq_put_hex_ll(m, ":", MINOR(dev), 2);
+	seq_put_decimal_ull(m, " ", ino);
+	seq_putc(m, ' ');
 }
 
 static void
@@ -483,10 +387,6 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	unsigned long start, end;
 	dev_t dev = 0;
 	const char *name = NULL;
-#ifdef CONFIG_KSU_SUSFS_SUS_MAPS
-	char *out_name;
-	int ret = 0;
-#endif
 
 	if (file) {
 		struct inode *inode = file_inode(vma->vm_file);
@@ -497,65 +397,16 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 
 	start = vma->vm_start;
 	end = vma->vm_end;
-
-#ifdef CONFIG_KSU_SUSFS_SUS_MAPS
-	out_name = kmalloc(SUSFS_MAX_LEN_PATHNAME, GFP_KERNEL);
-	if (!out_name)
-		goto orig_flow;
-	ret = susfs_sus_maps(ino, end - start, &ino, &dev, &flags, &pgoff, vma, out_name);
-
-orig_flow:
-#endif
-
-	if (show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino))
-		return;
-
-#ifdef CONFIG_KSU_SUSFS_SUS_MAPS
-	if (ret == 2) {
-		seq_pad(m, ' ');
-		seq_puts(m, out_name);
-		seq_putc(m, '\n');
-		kfree(out_name);
-		return;
-	}
-	kfree(out_name);
-#endif
+	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
 
 	/*
 	 * Print the dentry name for named mappings, and a
 	 * special [heap] marker for the heap:
 	 */
 	if (file) {
-		char *buf;
-		size_t size = seq_get_buf(m, &buf);
-
-		/*
-		 * This won't escape newline characters from the path. If a
-		 * program uses newlines in its paths then it can kick rocks.
-		 */
-		if (size > 1) {
-			const int inlen = size - 1;
-			int outlen = inlen;
-			char *p;
-
-			p = d_path_outlen(&file->f_path, buf, &outlen);
-			if (!IS_ERR(p)) {
-				size_t len;
-
-				if (outlen != inlen)
-					len = inlen - outlen - 1;
-				else
-					len = strlen(p);
-				memmove(buf, p, len);
-				buf[len] = '\n';
-				seq_commit(m, len + 1);
-				return;
-			}
-		}
-
-		/* Set the overflow status to get more memory */
-		seq_commit(m, -1);
-		return;
+		seq_pad(m, ' ');
+		seq_file_path(m, file, "\n");
+		goto done;
 	}
 
 	if (vma->vm_ops && vma->vm_ops->name) {
@@ -567,30 +418,32 @@ orig_flow:
 	name = arch_vma_name(vma);
 	if (!name) {
 		if (!mm) {
-			seq_write(m, "[vdso]\n", 7);
-			return;
+			name = "[vdso]";
+			goto done;
 		}
 
 		if (vma->vm_start <= mm->brk &&
 		    vma->vm_end >= mm->start_brk) {
-			seq_write(m, "[heap]\n", 7);
-			return;
+			name = "[heap]";
+			goto done;
 		}
 
 		if (is_stack(vma)) {
-			seq_write(m, "[stack]\n", 8);
-			return;
+			name = "[stack]";
+			goto done;
 		}
 
 		if (vma_get_anon_name(vma)) {
+			seq_pad(m, ' ');
 			seq_print_vma_name(m, vma);
-			return;
 		}
 	}
 
 done:
-	if (name)
+	if (name) {
+		seq_pad(m, ' ');
 		seq_puts(m, name);
+	}
 	seq_putc(m, '\n');
 }
 
@@ -1039,6 +892,7 @@ static int show_smap(struct seq_file *m, void *v)
 	if (vma_get_anon_name(vma)) {
 		seq_puts(m, "Name:           ");
 		seq_print_vma_name(m, vma);
+		seq_putc(m, '\n');
 	}
 
 	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
@@ -1047,6 +901,8 @@ static int show_smap(struct seq_file *m, void *v)
 	seq_puts(m, " kB\n");
 
 	__show_smap(m, &mss);
+
+	seq_printf(m, "THPeligible:    %d\n", transparent_hugepage_enabled(vma));
 
 	if (arch_pkeys_enabled())
 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
@@ -1091,6 +947,7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
 
 	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
 			       last_vma_end, 0, 0, 0, 0);
+	seq_pad(m, ' ');
 	seq_puts(m, "[rollup]\n");
 
 	__show_smap(m, &mss);
@@ -1848,7 +1705,87 @@ const struct file_operations proc_pagemap_operations = {
 };
 #endif /* CONFIG_PROC_PAGE_MONITOR */
 
+#ifdef CONFIG_FREEZING
+static inline bool is_pm_freezing(void)
+{
+	return pm_freezing;
+}
+#else
+static inline bool is_pm_freezing(void)
+{
+	return false;
+}
+#endif /* CONFIG_FREEZING */
+
 #ifdef CONFIG_PROCESS_RECLAIM
+static BLOCKING_NOTIFIER_HEAD(proc_reclaim_notifier);
+
+int proc_reclaim_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&proc_reclaim_notifier, nb);
+}
+
+int proc_reclaim_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&proc_reclaim_notifier, nb);
+}
+
+static void proc_reclaim_notify(unsigned long pid, void *rp)
+{
+	blocking_notifier_call_chain(&proc_reclaim_notifier, pid, rp);
+}
+
+int reclaim_address_space(struct address_space *mapping,
+			struct reclaim_param *rp)
+{
+	struct radix_tree_iter iter;
+	void __rcu **slot;
+	pgoff_t start;
+	struct page *page;
+	LIST_HEAD(page_list);
+	int reclaimed;
+	int ret = NOTIFY_OK;
+
+	lru_add_drain();
+	start = 0;
+	rcu_read_lock();
+
+	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+
+		page = radix_tree_deref_slot(slot);
+
+		if (radix_tree_deref_retry(page)) {
+			slot = radix_tree_iter_retry(&iter);
+			continue;
+		}
+
+		if (radix_tree_exceptional_entry(page))
+			continue;
+
+		if (isolate_lru_page(page))
+			continue;
+
+		rp->nr_scanned++;
+
+		list_add(&page->lru, &page_list);
+		inc_node_page_state(page, NR_ISOLATED_ANON +
+				page_is_file_cache(page));
+
+		if (need_resched()) {
+			slot = radix_tree_iter_resume(slot, &iter);
+			cond_resched_rcu();
+		}
+	}
+	rcu_read_unlock();
+	reclaimed = reclaim_pages_from_list(&page_list, NULL);
+	rp->nr_reclaimed += reclaimed;
+
+	if (rp->nr_scanned >= rp->nr_to_reclaim)
+		ret = NOTIFY_DONE;
+
+	return ret;
+}
+
 static int reclaim_pte_range(pmd_t *pmd, unsigned long addr,
 				unsigned long end, struct mm_walk *walk)
 {
@@ -1874,6 +1811,8 @@ static int reclaim_pte_range(pmd_t *pmd, unsigned long addr,
 cont:
 	if (rwsem_is_contended(&walk->mm->mmap_sem))
 		return -1;
+	if (is_pm_freezing())
+		return -1;
 
 	isolated = 0;
 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
@@ -1896,7 +1835,10 @@ cont:
 		if (PageUnevictable(page))
 			continue;
 
-		if (isolate_lru_page(page))
+		if (!PageLRU(page))
+			continue;
+
+		if (isolate_lru_page(compound_head(page)))
 			continue;
 
 		/* MADV_FREE clears pte dirty bit and then marks the page
@@ -1947,6 +1889,8 @@ static int writeback_pte_range(pmd_t *pmd, unsigned long addr,
 		return 0;
 	if (rwsem_is_contended(&mm->mmap_sem))
 		return -1;
+	if (is_pm_freezing())
+		return -1;
 	if (zram_is_app_launch())
 		return -EBUSY;
 
@@ -1979,6 +1923,29 @@ enum reclaim_type {
 	RECLAIM_WRITEBACK,
 #endif
 };
+
+struct reclaim_param reclaim_task_nomap(struct task_struct *task,
+		int nr_to_reclaim)
+{
+	struct mm_struct *mm;
+	struct reclaim_param rp = {
+		.nr_to_reclaim = nr_to_reclaim,
+	};
+
+	get_task_struct(task);
+	mm = get_task_mm(task);
+	if (!mm)
+		goto out;
+	down_read(&mm->mmap_sem);
+
+	proc_reclaim_notify((unsigned long)task_pid(task), (void *)&rp);
+
+	up_read(&mm->mmap_sem);
+	mmput(mm);
+out:
+	put_task_struct(task);
+	return rp;
+}
 
 struct reclaim_param reclaim_task_anon(struct task_struct *task,
 		int nr_to_reclaim)
@@ -2040,7 +2007,7 @@ static ssize_t reclaim_write(struct file *file, const char __user *buf,
 	struct reclaim_param rp;
 #ifdef CONFIG_ZRAM_LRU_WRITEBACK
 	struct zwbs *zwbs[NR_ZWBS];
-	int err;
+	int err = 0;
 #endif
 
 	memset(buffer, 0, sizeof(buffer));

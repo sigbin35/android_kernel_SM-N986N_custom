@@ -23,6 +23,9 @@ void psi_memstall_leave(unsigned long *flags);
 
 int psi_show(struct seq_file *s, struct psi_group *group, enum psi_res res);
 
+void psi_emergency_trigger(void);
+bool psi_is_trigger_active(void);
+
 #ifdef CONFIG_SAMSUNG_LMKD_DEBUG
 extern u64 psi_full_max;
 #endif
@@ -34,7 +37,7 @@ void cgroup_move_task(struct task_struct *p, struct css_set *to);
 
 struct psi_trigger *psi_trigger_create(struct psi_group *group,
 			char *buf, size_t nbytes, enum psi_res res);
-void psi_trigger_destroy(struct psi_trigger *t);
+void psi_trigger_replace(void **trigger_ptr, struct psi_trigger *t);
 
 __poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
 			poll_table *wait);
@@ -46,6 +49,12 @@ static inline void psi_init(void) {}
 
 static inline void psi_memstall_enter(unsigned long *flags) {}
 static inline void psi_memstall_leave(unsigned long *flags) {}
+
+static inline void psi_emergency_trigger(void){}
+static inline bool psi_is_trigger_active(void)
+{
+	return false;
+}
 
 #ifdef CONFIG_CGROUPS
 static inline int psi_cgroup_alloc(struct cgroup *cgrp)

@@ -554,15 +554,6 @@ config CFI_CLANG_SHADOW
 	  If you select this option, the kernel builds a fast look-up table of
 	  CFI check functions in loaded modules to reduce overhead.
 
-config LLVM_POLLY
-	bool "Enable LLVM's polyhedral loop optimizer (Polly)"
-	default n
-	help
-	  This option enables LLVM's polyhedral loop optimizer known as Polly.
-	  Polly is able to optimize various loops throughout the kernel for
-	  maximum cache locality. This requires an LLVM toolchain explicitly
-	  compiled with Polly support.
-
 config ARCH_SUPPORTS_SHADOW_CALL_STACK
 	bool
 	help
@@ -639,11 +630,6 @@ config HAVE_IRQ_TIME_ACCOUNTING
 	help
 	  Archs need to ensure they use a high enough resolution clock to
 	  support irq time accounting and then call enable_sched_clock_irqtime().
-
-config HAVE_MOVE_PMD
-	bool
-	help
-	  Archs that select this are able to move page tables at the PMD level.
 
 config HAVE_ARCH_TRANSPARENT_HUGEPAGE
 	bool
@@ -988,6 +974,15 @@ config HAVE_ARCH_PREL32_RELOCATIONS
 	  for PCI fixup, initcalls etc which are only half the size on 64 bit
 	  architectures, and don't require runtime relocation on relocatable
 	  kernels.
+
+config PANIC_ON_REFCOUNT_ERROR
+	bool "Kernel panic on refcount error detection"
+	depends on REFCOUNT_FULL
+	help
+	  If enabled, the kernel will panic when the refcount library
+	  has detected any type of error (e.g. potential use-after-free
+	  or potential memory-leaks) with an object associated with that
+	  reference counter.
 
 # Select if the architecture has support for applying RELR relocations.
 config ARCH_HAS_RELR

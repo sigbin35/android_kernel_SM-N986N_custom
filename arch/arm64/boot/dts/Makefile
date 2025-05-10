@@ -1,72 +1,55 @@
 # SPDX-License-Identifier: GPL-2.0
-dtb-y += exynos/exynos9830.dtb
+subdir-y += actions
+subdir-y += al
+subdir-y += allwinner
+subdir-y += altera
+subdir-y += amd
+subdir-y += amlogic
+subdir-y += apm
+subdir-y += arm
+subdir-y += broadcom
+subdir-y += cavium
+subdir-y += exynos
+subdir-y += freescale
+subdir-y += hisilicon
+subdir-y += lg
+subdir-y += marvell
+subdir-y += mediatek
+subdir-y += nvidia
+# subdir-y += qcom
+subdir-y += realtek
+subdir-y += renesas
+subdir-y += rockchip
+subdir-y += socionext
+subdir-y += sprd
+subdir-y += synaptics
+subdir-y += ti
+subdir-y += xilinx
+subdir-y += zte
+subdir-y += samsung
 
-dtbo-$(CONFIG_MODEL_X1SLTE) += samsung/exynos990-x1slte_eur_open_00.dtbo
-dtbo-$(CONFIG_MODEL_X1SLTE) += samsung/exynos990-x1slte_eur_open_21.dtbo
 
-dtbo-$(CONFIG_MODEL_X1S) += samsung/exynos990-x1s_eur_open_05.dtbo
-dtbo-$(CONFIG_MODEL_X1S) += samsung/exynos990-x1s_eur_open_16.dtbo
-dtbo-$(CONFIG_MODEL_X1S) += samsung/exynos990-x1s_eur_open_17.dtbo
-dtbo-$(CONFIG_MODEL_X1S) += samsung/exynos990-x1s_eur_open_19.dtbo
-dtbo-$(CONFIG_MODEL_X1S) += samsung/exynos990-x1s_eur_open_21.dtbo
+dtstree		:= $(srctree)/$(src)
 
-dtbo-$(CONFIG_MODEL_Y2SLTE) += samsung/exynos990-y2slte_eur_open_00.dtbo
-dtbo-$(CONFIG_MODEL_Y2SLTE) += samsung/exynos990-y2slte_eur_open_21.dtbo
+#vendor := $(dtstree)/vendor
+#ifneq "$(wildcard $(vendor)/Makefile)" ""
+#        subdir-y += vendor
+#endif
 
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_04.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_05.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_06.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_16.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_17.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_18.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_19.dtbo
-dtbo-$(CONFIG_MODEL_Y2S) += samsung/exynos990-y2s_eur_open_21.dtbo
+dtb-$(CONFIG_OF_ALL_DTBS) := $(patsubst $(dtstree)/%.dts,%.dtb, $(foreach d,$(subdir), $(wildcard $(dtstree)/$(d)/*.dts)))
 
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_16.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_17.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_18.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_20.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_21.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_22.dtbo
-dtbo-$(CONFIG_MODEL_Z3S) += samsung/exynos990-z3s_eur_open_24.dtbo
-
-dtbo-$(CONFIG_MODEL_C1SLTE) += samsung/exynos990-c1slte_eur_open_21.dtbo
-dtbo-$(CONFIG_MODEL_C1SLTE) += samsung/exynos990-c1slte_eur_open_24.dtbo
-dtbo-$(CONFIG_MODEL_C1SLTE) += samsung/exynos990-c1slte_eur_open_22.dtbo
-dtbo-$(CONFIG_MODEL_C1SLTE) += samsung/exynos990-c1slte_eur_open_20.dtbo
-
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_22.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_20.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_21.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_18.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_00.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_19.dtbo
-dtbo-$(CONFIG_MODEL_C1S) += samsung/exynos990-c1s_eur_open_24.dtbo
-
-dtbo-$(CONFIG_MODEL_C2SLTE) += samsung/exynos990-c2slte_eur_open_21.dtbo
-dtbo-$(CONFIG_MODEL_C2SLTE) += samsung/exynos990-c2slte_eur_openx_19.dtbo
-dtbo-$(CONFIG_MODEL_C2SLTE) += samsung/exynos990-c2slte_eur_open_24.dtbo
-dtbo-$(CONFIG_MODEL_C2SLTE) += samsung/exynos990-c2slte_eur_open_23.dtbo
-dtbo-$(CONFIG_MODEL_C2SLTE) += samsung/exynos990-c2slte_eur_open_22.dtbo
-
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_23.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_18.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_22.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_21.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_19.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_00.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_24.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_16.dtbo
-dtbo-$(CONFIG_MODEL_C2S) += samsung/exynos990-c2s_eur_openx_17.dtbo
-
-dtbo-$(CONFIG_MODEL_R8S) += samsung/exynos990-r8s_eur_open_00.dtbo
-dtbo-$(CONFIG_MODEL_R8S) += samsung/exynos990-r8s_eur_open_02.dtbo
-dtbo-$(CONFIG_MODEL_R8S) += samsung/exynos990-r8s_eur_open_05.dtbo
+always		:= $(dtb-y)
 
 targets += dtbs
-DTB_LIST  := $(dtb-y) $(dtbo-y)
-always    := $(DTB_LIST)
+
+DTB_NAMES := $(subst $\",,$(CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES))
+ifneq ($(DTB_NAMES),)
+DTB_LIST := $(addsuffix .dtb,$(DTB_NAMES))
+else
+DTB_LIST := $(dtb-y)
+endif
+targets += $(DTB_LIST)
 
 dtbs: $(addprefix $(obj)/, $(DTB_LIST))
 
-clean-files := *.dtb*
+clean-files := dts/*.dtb *.dtb

@@ -360,7 +360,7 @@ static int gfs2_write_cache_jdata(struct address_space *mapping,
 	int done = 0;
 	struct pagevec pvec;
 	int nr_pages;
-	pgoff_t writeback_index;
+	pgoff_t uninitialized_var(writeback_index);
 	pgoff_t index;
 	pgoff_t end;
 	pgoff_t done_index;
@@ -504,7 +504,7 @@ int stuffed_readpage(struct gfs2_inode *ip, struct page *page)
  * called by gfs2_readpage() once the required lock has been granted.
  */
 
-static int __gfs2_readpage(void *file, struct page *page)
+static int __gfs2_readpage(struct file *file, struct page *page)
 {
 	struct gfs2_inode *ip = GFS2_I(page->mapping->host);
 	struct gfs2_sbd *sdp = GFS2_SB(page->mapping->host);

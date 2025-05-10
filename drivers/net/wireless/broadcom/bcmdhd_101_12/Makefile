@@ -330,13 +330,16 @@ endif
 # WLC_E_SET_SSID fail
 DHDCFLAGS += -DSET_SSID_FAIL_CUSTOM_RC=100
 
-DHDCFLAGS += -DANDROID_PLATFORM_VERSION=13
+# Android Version Check from Platform source
+DHDCFLAGS += -DANDROID_PLATFORM_VERSION=11
+
 DHDCFLAGS += -DCUSTOM_ASSOC_TIMEOUT=20
 
 # Change Dump path by Android Global DE Policy
 ifeq ($(CONFIG_WLAN_VENDOR_DUMP_ENABLE),y)
        DHDCFLAGS += -DDHD_COMMON_DUMP_PATH="\"/data/vendor/log/wifi/\""
        DHDCFLAGS += -DDHD_FILE_DUMP_EVENT
+       DHDCFLAGS += -DDHD_SUPPORT_COMPRESS_DEBUG_DUMP
        DHDCFLAGS := $(filter-out -DDHD_DUMP_FILE_WRITE_FROM_KERNEL ,$(DHDCFLAGS))
 endif
 
@@ -630,7 +633,7 @@ ifeq ($(CONFIG_SEC_FACTORY),y)
 # Detect FW Memory Corruption
   DHDCFLAGS += -DDHD_FW_MEM_CORRUPTION
 # Detect turn on failure
-  DHDCFLAGS += -DBCM_DETECT_TURN_ON_FAILURE
+#  DHDCFLAGS += -DBCM_DETECT_TURN_ON_FAILURE
 endif # CONFIG_SEC_FACTORY
 
 ifeq ($(CONFIG_BCM4389),y)
@@ -890,7 +893,7 @@ ifeq ($(CONFIG_SEC_FACTORY),y)
 # Detect FW Memory Corruption
   DHDCFLAGS += -DDHD_FW_MEM_CORRUPTION
 # Detect turn on failure
-  DHDCFLAGS += -DBCM_DETECT_TURN_ON_FAILURE
+#  DHDCFLAGS += -DBCM_DETECT_TURN_ON_FAILURE
 endif # CONFIG_SEC_FACTORY
 
 ifeq ($(CONFIG_BCM4375),y)
@@ -1712,6 +1715,7 @@ ifeq ($(CONFIG_ARCH_SM8150),y)
 endif
 ifeq ($(CONFIG_ARCH_KONA),y)
   DHDCFLAGS += -Wno-date-time
+  DHDCFLAGS += -Wno-pointer-compare
   DHDCFLAGS += -Wno-sometimes-uninitialized
 endif
 

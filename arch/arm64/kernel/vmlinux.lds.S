@@ -68,6 +68,10 @@ jiffies = jiffies_64;
 #define TRAMP_TEXT
 #endif
 
+#define RTIC_BSS					\
+	. = ALIGN(PAGE_SIZE);				\
+	KEEP(*(.bss.rtic));			\
+	. = ALIGN(PAGE_SIZE);				\
 /*
  * The size of the PE/COFF section that covers the kernel image, which
  * runs from stext to _edata, must be a round multiple of the PE/COFF
@@ -151,11 +155,11 @@ SECTIONS
 	. = ALIGN(4);
 	.altinstructions : {
 		__alt_instructions = .;
-		KEEP(*(.altinstructions))
+		*(.altinstructions)
 		__alt_instructions_end = .;
 	}
 	.altinstr_replacement : {
-		KEEP(*(.altinstr_replacement))
+		*(.altinstr_replacement)
 	}
 
 	. = ALIGN(PAGE_SIZE);
@@ -230,6 +234,7 @@ SECTIONS
 	BSS_SECTION(0, 0, 0)
 
 	. = ALIGN(PAGE_SIZE);
+#ifndef CONFIG_UH_RKP
 	idmap_pg_dir = .;
 	. += IDMAP_DIR_SIZE;
 
@@ -245,12 +250,17 @@ SECTIONS
 	swapper_pg_dir = .;
 	. += SWAPPER_DIR_SIZE;
 	swapper_pg_end = .;
+#endif
 	__pecoff_data_size = ABSOLUTE(. - __initdata_begin);
 	_end = .;
 
 	STABS_DEBUG
 
 	HEAD_SYMBOLS
+
+	.bss : {			/* bss segment		*/
+         RTIC_BSS
+	}
 }
 
 /*
